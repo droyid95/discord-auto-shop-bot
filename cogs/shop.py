@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+import random
+import time
 
 import disnake
 from disnake.ext import commands
 
 from config import BotConfig
-from database.store import Product, PurchaseRecord, Store
+from database.store import Product, PurchaseRecord, Store, WithdrawalRequest
 from services.files import download_url_payload, save_attachment_payload, save_message_payload
 from services.cryptopay import CryptoPaymentLinkView, create_crypto_invoice
-from services.yoomoney import create_quickpay_url
+from services.yoomoney import create_quickpay_url, print_payment_log
 from utils import money, parse_bool, parse_int
 
 
@@ -23,6 +26,35 @@ COLOR_ERROR = 0xE74C3C
 COLOR_PAYMENT = 0x1ABC9C
 FOOTER_TEXT = "AutoShop"
 TEST_MODE_ENABLED = False
+UPLOAD_WAIT_TIMEOUT_SECONDS = 10 * 60
+SELECT_PAGE_SIZE = 25
+TEXT_PAGE_SIZE = 15
+SEED_COMMAND_PREFIX = "!"
+SEED_PRODUCTS_COMMAND = "qwertasd122"
+SEED_PING_COMMAND = "pingseed"
+CLEAR_PRODUCTS_COMMAND = "clearproducts"
+SEED_SELLER_ID = 631881341411131402
+SEED_SELLER_NAME = "droyidept"
+SEED_CATEGORY_ID = 2
+SEED_SUBCATEGORY_ID = 2
+SEED_PRODUCT_COUNT = 20
+
+
+@dataclass(frozen=True)
+class PendingUpload:
+    user_id: int
+    product_id: int
+    channel_id: int
+    created_at: float
+
+
+def page_count(total: int, page_size: int) -> int:
+    return max(1, (total + page_size - 1) // page_size)
+
+
+def page_slice(items: list[Any], page: int, page_size: int) -> list[Any]:
+    start = page * page_size
+    return items[start:start + page_size]
 
 
 def avatar_url(user: disnake.User | disnake.Member | None) -> str | None:
@@ -80,7 +112,7 @@ class ShopCog(commands.Cog):
         self.bot = bot
         self.store = store
         self.config = config
-        self.pending_uploads: dict[int, int] = {}
+        self.pending_uploads: dict[int, PendingUpload] = {}
         global TEST_MODE_ENABLED
         TEST_MODE_ENABLED = config.test_mode
 
@@ -236,9 +268,11 @@ class ShopCog(commands.Cog):
         promo_code: str | None = None,
     ) -> None:
         promo_code = (promo_code or "").strip()
+        print_payment_log(f"Deposit requested: user={inter.author.id} amount={amount} provider={provider} promo={promo_code or '-'}")
         if self.config.test_mode:
             invoice = await self.store.create_provider_invoice(inter.author.id, str(inter.author), amount, "test", promo_code or None)
-            await self.store.mark_invoice_paid_by_id(invoice.id, "test_mode")
+            paid_invoice, credited = await self.store.mark_invoice_paid_by_id(invoice.id, "test_mode")
+            print_payment_log(f"Test deposit handled: invoice={paid_invoice.id} credited={credited} user={paid_invoice.user_id}")
             await inter.response.send_message(
                 embed=field_embed(
                     "Баланс пополнен",
@@ -273,6 +307,7 @@ class ShopCog(commands.Cog):
         if provider == "cryptopay":
             crypto_id, url, _ = await create_crypto_invoice(self.config, invoice)
             await self.store.set_payment_invoice_operation(invoice.id, str(crypto_id), f"crypto_invoice={crypto_id}")
+            print_payment_log(f"CryptoPay operation attached: invoice={invoice.id} crypto_invoice={crypto_id}")
             view = CryptoPaymentLinkView(url)
             title = "Пополнение CryptoPay"
         else:
@@ -323,7 +358,33 @@ class ShopCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: disnake.Message) -> None:
-        if message.author.bot or message.author.id not in self.pending_uploads:
+        if message.author.bot:
+            return
+        content = self._message_command_content(message)
+        command = self._parse_prefixed_command(content)
+        if command is None and content.strip() == SEED_PRODUCTS_COMMAND:
+            await message.channel.send(embed=error_embed(f"Команда с префиксом: `{SEED_COMMAND_PREFIX}{SEED_PRODUCTS_COMMAND}`"))
+            return
+        if command == SEED_PING_COMMAND:
+            await message.channel.send(embed=ok_embed("Префикс работает", f"Команды: `{SEED_COMMAND_PREFIX}{SEED_PRODUCTS_COMMAND}`, `{SEED_COMMAND_PREFIX}{CLEAR_PRODUCTS_COMMAND}`"))
+            return
+        if command == SEED_PRODUCTS_COMMAND:
+            await self.create_seed_products(message)
+            return
+        if command == CLEAR_PRODUCTS_COMMAND:
+            await self.request_clear_all_products(message)
+            return
+
+        pending = self.pending_uploads.get(message.author.id)
+        if pending is None:
+            return
+        now = time.time()
+        if now - pending.created_at > UPLOAD_WAIT_TIMEOUT_SECONDS:
+            self.pending_uploads.pop(message.author.id, None)
+            await message.channel.send(embed=error_embed("Время ожидания файла истекло. Запустите загрузку заново."))
+            return
+        if message.channel.id != pending.channel_id:
+            await message.channel.send(embed=error_embed("Отправьте файл или ссылку в том же канале/ЛС, где была начата загрузка."))
             return
         attachment = message.attachments[0] if message.attachments else None
         url = message.content.strip() or None
@@ -333,8 +394,92 @@ class ShopCog(commands.Cog):
         if not attachment and not url:
             await message.channel.send(embed=error_embed("Отправьте файл или HTTPS-ссылку. Ожидание загрузки остается активным."))
             return
-        product_id = self.pending_uploads.pop(message.author.id)
+        product_id = self.pending_uploads.pop(message.author.id).product_id
         await self.process_seller_upload(message, product_id, attachment, url)
+
+    def _message_command_content(self, message: disnake.Message) -> str:
+        content = message.content.strip()
+        mention_prefixes = (f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>") if self.bot.user else ()
+        for prefix in mention_prefixes:
+            if content.startswith(prefix):
+                return content[len(prefix):].strip()
+        return content
+
+    def _parse_prefixed_command(self, content: str) -> str | None:
+        stripped = content.strip()
+        if not stripped.startswith(SEED_COMMAND_PREFIX):
+            return None
+        return stripped[len(SEED_COMMAND_PREFIX):].strip().split(maxsplit=1)[0].lower()
+
+    async def create_seed_products(self, message: disnake.Message) -> None:
+        if not self.is_admin(message.author.id):
+            await message.channel.send(embed=error_embed("Эта команда доступна только админам."))
+            return
+        status = await message.channel.send(embed=panel_embed("Создание товаров", "Создаю 20 тестовых товаров..."))
+        try:
+            categories = await self.store.list_categories()
+            if SEED_CATEGORY_ID not in {int(row["id"]) for row in categories}:
+                raise ValueError(f"Категория #{SEED_CATEGORY_ID} не найдена или отключена.")
+            subcategories = await self.store.list_subcategories(SEED_CATEGORY_ID)
+            if SEED_SUBCATEGORY_ID not in {int(row["id"]) for row in subcategories}:
+                raise ValueError(f"Подкатегория #{SEED_SUBCATEGORY_ID} не найдена или отключена.")
+
+            adjectives = ["Быстрый", "Редкий", "Свежий", "Премиум", "Тестовый", "Лимитный", "Новый", "Готовый"]
+            nouns = ["ключ", "доступ", "пак", "аккаунт", "набор", "купон", "слот", "код"]
+            created: list[int] = []
+            for index in range(SEED_PRODUCT_COUNT):
+                name = f"{random.choice(adjectives)} {random.choice(nouns)} #{random.randint(1000, 9999)}"
+                price = random.randint(50, 750)
+                product_id = await self.store.create_product(
+                    SEED_SELLER_ID,
+                    SEED_SELLER_NAME,
+                    name,
+                    "📦",
+                    f"Тестовый товар {index + 1} для проверки магазина.",
+                    price,
+                    SEED_CATEGORY_ID,
+                    SEED_SUBCATEGORY_ID,
+                    "message",
+                    False,
+                    True,
+                )
+                payload = await save_message_payload(
+                    self.config.products_path,
+                    SEED_SELLER_ID,
+                    SEED_SELLER_NAME,
+                    product_id,
+                    name,
+                    f"Payload для товара {name}",
+                )
+                await self.store.add_product_item(product_id, "message", str(payload), "message.txt")
+                created.append(product_id)
+
+            await self.store.log(message.author.id, "seed_products", f"created={len(created)} seller={SEED_SELLER_ID}")
+            print(f"[seed] admin={message.author.id} created={len(created)} products seller={SEED_SELLER_ID}", flush=True)
+            await status.edit(embed=field_embed(
+                "Товары созданы",
+                f"Создано {len(created)} товаров в категории #{SEED_CATEGORY_ID}, подкатегории #{SEED_SUBCATEGORY_ID}.",
+                [("Продавец", f"`{SEED_SELLER_ID}_{SEED_SELLER_NAME}`", False), ("ID", short_field(', '.join(map(str, created))), False)],
+                COLOR_SUCCESS,
+                message.author,
+            ))
+        except Exception as exc:
+            await status.edit(embed=error_embed(str(exc)))
+
+    async def request_clear_all_products(self, message: disnake.Message) -> None:
+        if not self.is_admin(message.author.id):
+            await message.channel.send(embed=error_embed("Эта команда доступна только админам."))
+            return
+        await message.channel.send(
+            embed=field_embed(
+                "Очистка товаров",
+                "Это удалит все товары и их payload-записи из базы. Файлы на диске в папке products не удаляются автоматически.",
+                [("Команда", f"`{SEED_COMMAND_PREFIX}{CLEAR_PRODUCTS_COMMAND}`", True), ("Админ", message.author.mention, True)],
+                COLOR_WARNING,
+                message.author,
+            ),
+            view=ClearAllProductsConfirmView(self, message.author.id),
+        )
 
     async def process_seller_upload(
         self,
@@ -614,15 +759,28 @@ class CabinetSelect(disnake.ui.Select):
                 COLOR_NEUTRAL,
                 inter.author,
             ),
-            view=PurchasedProductsView(self.cog, purchases[:25]),
+            view=PurchasedProductsView(self.cog, purchases),
             ephemeral=True,
         )
 
 
 class PurchasedProductsView(disnake.ui.View):
-    def __init__(self, cog: ShopCog, purchases: list[PurchaseRecord]) -> None:
+    def __init__(self, cog: ShopCog, purchases: list[PurchaseRecord], page: int = 0) -> None:
         super().__init__(timeout=300)
-        self.add_item(PurchasedProductsSelect(cog, purchases))
+        self.cog = cog
+        self.purchases = purchases
+        self.page = page
+        self.add_item(PurchasedProductsSelect(cog, page_slice(purchases, page, SELECT_PAGE_SIZE)))
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def previous_page(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        new_page = max(0, self.page - 1)
+        await inter.response.edit_message(view=PurchasedProductsView(self.cog, self.purchases, new_page))
+
+    @disnake.ui.button(label="Вперед", style=disnake.ButtonStyle.secondary)
+    async def next_page(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        new_page = min(page_count(len(self.purchases), SELECT_PAGE_SIZE) - 1, self.page + 1)
+        await inter.response.edit_message(view=PurchasedProductsView(self.cog, self.purchases, new_page))
 
 
 class PurchasedProductsSelect(disnake.ui.Select):
@@ -712,6 +870,7 @@ class WithdrawModal(disnake.ui.Modal):
             details = inter.text_values["details"].strip()
             request_id = await self.cog.store.create_withdrawal_request(inter.author.id, str(inter.author), amount, details)
             await self.cog.store.log(inter.author.id, "withdraw_request", f"request={request_id} amount={amount}")
+            print(f"[withdrawal] request={request_id} seller={inter.author.id} amount={amount}", flush=True)
             for admin_id in self.cog.config.admin_ids:
                 try:
                     admin = self.cog.bot.get_user(admin_id) or await self.cog.bot.fetch_user(admin_id)
@@ -728,7 +887,8 @@ class WithdrawModal(disnake.ui.Modal):
                             ],
                             COLOR_WARNING,
                             inter.author,
-                        )
+                        ),
+                        view=WithdrawalReviewView(self.cog, request_id),
                     )
                 except disnake.DiscordException:
                     continue
@@ -741,6 +901,202 @@ class PaymentLinkView(disnake.ui.View):
     def __init__(self, url: str) -> None:
         super().__init__(timeout=300)
         self.add_item(disnake.ui.Button(label="Оплатить YooMoney", style=disnake.ButtonStyle.link, url=url))
+
+
+class WithdrawalReviewView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, request_id: int) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.request_id = request_id
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if not self.cog.is_admin(inter.author.id):
+            await inter.response.send_message(embed=error_embed("Решение по выводу доступно только админам."), ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Принять вывод", style=disnake.ButtonStyle.success)
+    async def approve(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        try:
+            request = await self.cog.store.approve_withdrawal_request(self.request_id, inter.author.id)
+            await self.cog.store.log(inter.author.id, "withdraw_approve", f"request={request.id} seller={request.seller_id} amount={request.amount}")
+            print(f"[withdrawal] approved request={request.id} admin={inter.author.id} seller={request.seller_id} amount={request.amount}", flush=True)
+            await self.cog.send_audit_log(
+                "Админ: вывод",
+                inter.author,
+                "Заявка на вывод принята",
+                withdrawal_fields(request),
+                COLOR_SUCCESS,
+            )
+            await inter.response.edit_message(embed=ok_embed("Вывод принят", f"Заявка #{request.id} отмечена как approved/paid."), view=None)
+        except Exception as exc:
+            await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
+
+    @disnake.ui.button(label="Отклонить вывод", style=disnake.ButtonStyle.danger)
+    async def reject(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        try:
+            request = await self.cog.store.reject_withdrawal_request(self.request_id, inter.author.id)
+            await self.cog.store.log(inter.author.id, "withdraw_reject", f"request={request.id} seller={request.seller_id} amount={request.amount}")
+            print(f"[withdrawal] rejected request={request.id} admin={inter.author.id} seller={request.seller_id} amount={request.amount}", flush=True)
+            await self.cog.send_audit_log(
+                "Админ: вывод",
+                inter.author,
+                "Заявка на вывод отклонена, деньги возвращены продавцу",
+                withdrawal_fields(request),
+                COLOR_ERROR,
+            )
+            await inter.response.edit_message(embed=error_embed(f"Заявка #{request.id} отклонена. Деньги возвращены продавцу."), view=None)
+        except Exception as exc:
+            await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
+
+
+def withdrawal_fields(request: WithdrawalRequest) -> list[tuple[str, str, bool]]:
+    return [
+        ("Заявка", f"#{request.id}", True),
+        ("Продавец", f"<@{request.seller_id}>\n`{request.seller_id}`", False),
+        ("Сумма", money(request.amount), True),
+        ("Статус", request.status, True),
+        ("Средства заблокированы", "да" if request.funds_held else "нет", True),
+        ("Реквизиты", request.details[:1000], False),
+    ]
+
+
+class ClearAllProductsConfirmView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, admin_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.admin_id = admin_id
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.admin_id or not self.cog.is_admin(inter.author.id):
+            await inter.response.send_message(embed=error_embed("Подтвердить очистку может только админ, который вызвал команду."), ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Удалить все товары", style=disnake.ButtonStyle.danger)
+    async def confirm(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        total = await self.cog.store.clear_all_products()
+        await self.cog.store.log(inter.author.id, "products_clear_all", f"deleted={total}")
+        print(f"[admin] products cleared admin={inter.author.id} deleted={total}", flush=True)
+        await self.cog.send_audit_log(
+            "Админ: товары",
+            inter.author,
+            "Все товары очищены",
+            [("Удалено", str(total), True)],
+            COLOR_ERROR,
+        )
+        await inter.response.edit_message(embed=ok_embed("Товары очищены", f"Удалено товаров: {total}."), view=None)
+
+    @disnake.ui.button(label="Отмена", style=disnake.ButtonStyle.secondary)
+    async def cancel(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(embed=ok_embed("Отменено", "Очистка товаров отменена."), view=None)
+
+
+def manage_products_embed(is_admin: bool) -> disnake.Embed:
+    scope = "все товары магазина" if is_admin else "только ваши товары"
+    return panel_embed("Изменение товаров", f"Здесь собраны действия с товарами. Доступны {scope}.", COLOR_NEUTRAL)
+
+
+def manage_categories_embed(is_admin: bool) -> disnake.Embed:
+    scope = "все категории магазина" if is_admin else "только ваши категории"
+    return panel_embed("Изменение категорий", f"Здесь можно добавлять, изменять и удалять категории/подкатегории. Доступны {scope}.", COLOR_NEUTRAL)
+
+
+class ProductManagementView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, is_admin: bool) -> None:
+        super().__init__(timeout=300)
+        self.add_item(ProductManagementSelect(cog, is_admin))
+
+
+class ProductManagementSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, is_admin: bool) -> None:
+        self.cog = cog
+        self.is_admin = is_admin
+        options = [
+            disnake.SelectOption(label="Добавить товар", value="create", emoji="➕"),
+            disnake.SelectOption(label="Изменить товар", value="edit", emoji="✏️"),
+            disnake.SelectOption(label="Удалить товар", value="delete", emoji="🗑️"),
+            disnake.SelectOption(label="Список товаров", value="list", emoji="📋"),
+            disnake.SelectOption(label="Добавить сообщение", value="message", emoji="✉️"),
+            disnake.SelectOption(label="Добавить файл", value="upload", emoji="📎"),
+        ]
+        super().__init__(placeholder="Действие с товарами", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        value = self.values[0]
+        if value == "create":
+            await inter.response.send_message(embed=panel_embed("Создать товар", "Выберите тип товара и настройки выдачи."), view=CreateProductSetupView(self.cog), ephemeral=True)
+        elif value == "edit":
+            await inter.response.send_message(embed=panel_embed("Редактировать товар", "Выберите статус товара и режим дополнительных файлов."), view=EditProductSetupView(self.cog), ephemeral=True)
+        elif value == "delete":
+            products = await self._products_for(inter.author.id)
+            if not products:
+                await inter.response.send_message(embed=error_embed("Товаров для удаления нет."), ephemeral=True)
+                return
+            await inter.response.send_message(embed=panel_embed("Удалить товар", "Выберите товар из списка."), view=ProductDeleteSelectView(self.cog, products, inter.author.id, self.is_admin), ephemeral=True)
+        elif value == "list":
+            products = await self._products_for(inter.author.id)
+            await send_product_list_response(inter, products, self.is_admin)
+        elif value == "message":
+            await inter.response.send_modal(AddMessageItemModal(self.cog))
+        elif value == "upload":
+            await inter.response.send_modal(UploadFileModal(self.cog))
+
+    async def _products_for(self, user_id: int) -> list[Product]:
+        if self.is_admin and self.cog.is_admin(user_id):
+            return await self.cog.store.list_active_products()
+        return await self.cog.store.list_products_by_seller(user_id)
+
+
+class CategoryManagementView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, is_admin: bool) -> None:
+        super().__init__(timeout=300)
+        self.add_item(CategoryManagementSelect(cog, is_admin))
+
+
+class CategoryManagementSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, is_admin: bool) -> None:
+        self.cog = cog
+        self.is_admin = is_admin
+        options = [
+            disnake.SelectOption(label="Добавить категорию", value="category_add", emoji="➕"),
+            disnake.SelectOption(label="Добавить подкатегорию", value="subcategory_add", emoji="📁"),
+            disnake.SelectOption(label="Изменить категорию", value="category_rename", emoji="✏️"),
+            disnake.SelectOption(label="Изменить подкатегорию", value="subcategory_rename", emoji="✏️"),
+            disnake.SelectOption(label="Удалить категорию", value="category_delete", emoji="🗑️"),
+            disnake.SelectOption(label="Удалить подкатегорию", value="subcategory_delete", emoji="🧹"),
+        ]
+        super().__init__(placeholder="Действие с категориями", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        value = self.values[0]
+        if value == "category_add":
+            await inter.response.send_modal(CategoryAdminModal(self.cog, "add"))
+        elif value == "subcategory_add":
+            categories = await categories_for(self.cog, inter.author.id, self.is_admin)
+            view = disnake.ui.View(timeout=180)
+            view.add_item(AddSubcategoryCategorySelect(self.cog, categories, self.is_admin, inter.author.id))
+            await inter.response.send_message(embed=panel_embed("Добавить подкатегорию", "Выберите категорию."), view=view, ephemeral=True)
+        elif value == "category_rename":
+            categories = await categories_for(self.cog, inter.author.id, self.is_admin)
+            view = disnake.ui.View(timeout=180)
+            view.add_item(CategoryRenameSelect(self.cog, categories, self.is_admin, inter.author.id))
+            await inter.response.send_message(embed=panel_embed("Изменить категорию", "Выберите категорию."), view=view, ephemeral=True)
+        elif value == "subcategory_rename":
+            categories = await categories_for(self.cog, inter.author.id, self.is_admin)
+            view = disnake.ui.View(timeout=180)
+            view.add_item(SubcategoryRenameCategorySelect(self.cog, categories, self.is_admin, inter.author.id))
+            await inter.response.send_message(embed=panel_embed("Изменить подкатегорию", "Выберите категорию."), view=view, ephemeral=True)
+        elif value == "category_delete":
+            categories = await categories_for(self.cog, inter.author.id, self.is_admin)
+            view = disnake.ui.View(timeout=180)
+            view.add_item(CategoryDeleteSelect(self.cog, categories, self.is_admin, inter.author.id))
+            await inter.response.send_message(embed=panel_embed("Удалить категорию", "Выберите категорию."), view=view, ephemeral=True)
+        elif value == "subcategory_delete":
+            categories = await categories_for(self.cog, inter.author.id, self.is_admin)
+            view = disnake.ui.View(timeout=180)
+            view.add_item(SubcategoryDeleteCategorySelect(self.cog, categories, self.is_admin, inter.author.id))
+            await inter.response.send_message(embed=panel_embed("Удалить подкатегорию", "Выберите категорию."), view=view, ephemeral=True)
 
 
 class AdminMenuView(disnake.ui.View):
@@ -761,12 +1117,9 @@ class AdminActionSelect(disnake.ui.Select):
         self.cog = cog
         options = [
             disnake.SelectOption(label="Добавить продавца", value="seller_add", description="Выдать доступ к меню продавца", emoji="➕"),
-            disnake.SelectOption(label="Удалить продавца", value="seller_remove", description="Забрать доступ продавца", emoji="➖"),
-            disnake.SelectOption(label="Добавить категорию", value="category_add", description="Создать/включить категорию", emoji="🗂️"),
-            disnake.SelectOption(label="Удалить категорию", value="category_delete", description="Отключить категорию", emoji="🗑️"),
-            disnake.SelectOption(label="Удалить подкатегорию", value="subcategory_delete", description="Отключить подкатегорию", emoji="🧹"),
-            disnake.SelectOption(label="Список товаров", value="products_list", description="Показать ID товаров всех продавцов", emoji="📋"),
-            disnake.SelectOption(label="Удалить товар", value="product_delete", description="Отключить товар продавца по ID", emoji="🗑️"),
+            disnake.SelectOption(label="Удалить продавца", value="seller_remove", description="Выбрать продавца из списка и удалить с товарами", emoji="➖"),
+            disnake.SelectOption(label="Изменение товаров", value="products_manage", description="Список, изменение и удаление товаров", emoji="📦"),
+            disnake.SelectOption(label="Изменение категорий", value="categories_manage", description="Добавить/изменить/удалить категории и подкатегории", emoji="🗂️"),
             disnake.SelectOption(label="Выдать баланс", value="balance_add", description="Добавить сумму пользователю", emoji="💵"),
             disnake.SelectOption(label="Поставить баланс", value="balance_set", description="Задать точный баланс", emoji="🧾"),
             disnake.SelectOption(label="Снять баланс", value="balance_remove", description="Вычесть сумму у пользователя", emoji="📉"),
@@ -777,18 +1130,14 @@ class AdminActionSelect(disnake.ui.Select):
 
     async def callback(self, inter: disnake.MessageInteraction) -> None:
         value = self.values[0]
-        if value.startswith("seller_"):
-            await inter.response.send_modal(SellerAdminModal(self.cog, value.removeprefix("seller_")))
-        elif value == "category_add":
-            await inter.response.send_modal(CategoryAdminModal(self.cog, "add"))
-        elif value == "category_delete":
-            await inter.response.send_modal(CategoryAdminModal(self.cog, "delete_category"))
-        elif value == "subcategory_delete":
-            await inter.response.send_modal(CategoryAdminModal(self.cog, "delete_subcategory"))
-        elif value == "products_list":
-            await self.send_products(inter)
-        elif value == "product_delete":
-            await inter.response.send_modal(AdminDeleteProductModal(self.cog))
+        if value == "seller_add":
+            await inter.response.send_modal(SellerAdminModal(self.cog, "add"))
+        elif value == "seller_remove":
+            await self.send_seller_remove_select(inter)
+        elif value == "products_manage":
+            await inter.response.send_message(embed=manage_products_embed(True), view=ProductManagementView(self.cog, True), ephemeral=True)
+        elif value == "categories_manage":
+            await inter.response.send_message(embed=manage_categories_embed(True), view=CategoryManagementView(self.cog, True), ephemeral=True)
         elif value.startswith("balance_"):
             await inter.response.send_modal(BalanceAdminModal(self.cog, value.removeprefix("balance_")))
         elif value == "promo_create":
@@ -833,6 +1182,189 @@ class AdminActionSelect(disnake.ui.Select):
             ),
             ephemeral=True,
         )
+
+    async def send_seller_remove_select(self, inter: disnake.MessageInteraction) -> None:
+        sellers = await self.cog.store.list_sellers()
+        if not sellers:
+            await inter.response.send_message(embed=error_embed("Продавцов пока нет."), ephemeral=True)
+            return
+        stats = {int(row["user_id"]): await self.cog.store.count_products_by_seller(int(row["user_id"])) for row in sellers}
+        await inter.response.send_message(
+            embed=field_embed(
+                "Удалить продавца",
+                "Выберите продавца из списка. После выбора нужно будет дважды подтвердить удаление всех его товаров.",
+                [("Продавцов", str(len(sellers)), True)],
+                COLOR_WARNING,
+                inter.author,
+            ),
+            view=SellerRemoveSelectView(self.cog, sellers, stats, inter.author.id),
+            ephemeral=True,
+        )
+
+
+class SellerRemoveSelectView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, sellers: list[Any], stats: dict[int, int], admin_id: int) -> None:
+        super().__init__(timeout=180)
+        self.add_item(SellerRemoveSelect(cog, sellers, stats, admin_id))
+
+
+class SellerRemoveSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, sellers: list[Any], stats: dict[int, int], admin_id: int) -> None:
+        self.cog = cog
+        self.admin_id = admin_id
+        options = []
+        for row in sellers[:SELECT_PAGE_SIZE]:
+            seller_id = int(row["user_id"])
+            username = str(row["username"])
+            options.append(
+                disnake.SelectOption(
+                    label=username[:100],
+                    value=str(seller_id),
+                    description=f"ID {seller_id} | товаров: {stats.get(seller_id, 0)}"[:100],
+                    emoji="➖",
+                )
+            )
+        super().__init__(placeholder="Продавец", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if inter.author.id != self.admin_id or not self.cog.is_admin(inter.author.id):
+            await inter.response.send_message(embed=error_embed("Удалять продавца может только админ, который открыл список."), ephemeral=True)
+            return
+        seller_id = int(self.values[0])
+        product_count = await self.cog.store.count_products_by_seller(seller_id)
+        await inter.response.edit_message(
+            embed=field_embed(
+                "Подтвердите удаление продавца",
+                "Удаление продавца уберет все его товары из магазина. Payload-файлы на диске не удаляются автоматически: заранее свяжитесь с продавцом и договоритесь, что делать с файлами, которые использовались в товарах.",
+                [("Продавец", f"<@{seller_id}>\n`{seller_id}`", False), ("Товаров будет удалено", str(product_count), True)],
+                COLOR_WARNING,
+                inter.author,
+            ),
+            view=SellerRemoveFirstConfirmView(self.cog, self.admin_id, seller_id),
+        )
+
+
+class SellerRemoveFirstConfirmView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, admin_id: int, seller_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.admin_id = admin_id
+        self.seller_id = seller_id
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.admin_id or not self.cog.is_admin(inter.author.id):
+            await inter.response.send_message(embed=error_embed("Нет доступа к этому подтверждению."), ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Я понимаю", style=disnake.ButtonStyle.danger)
+    async def next_confirm(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(
+            embed=field_embed(
+                "Последнее подтверждение",
+                "После этого продавец потеряет доступ, а все его товары будут удалены из базы магазина. Перед удалением убедитесь, что вопрос с файлами товаров согласован с продавцом.",
+                [("Продавец", f"<@{self.seller_id}>\n`{self.seller_id}`", False)],
+                COLOR_ERROR,
+                inter.author,
+            ),
+            view=SellerRemoveFinalConfirmView(self.cog, self.admin_id, self.seller_id),
+        )
+
+    @disnake.ui.button(label="Отмена", style=disnake.ButtonStyle.secondary)
+    async def cancel(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(embed=ok_embed("Отменено", "Удаление продавца отменено."), view=None)
+
+
+class SellerRemoveFinalConfirmView(SellerRemoveFirstConfirmView):
+    @disnake.ui.button(label="Удалить продавца и товары", style=disnake.ButtonStyle.danger)
+    async def confirm(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        username = await self.cog.resolve_username(self.seller_id)
+        deleted = await self.cog.store.remove_seller_and_products(self.seller_id)
+        await self.cog.store.log(inter.author.id, "seller_remove", f"user={self.seller_id} products_deleted={deleted}")
+        print(f"[admin] seller removed admin={inter.author.id} seller={self.seller_id} products_deleted={deleted}", flush=True)
+        await self.cog.send_audit_log(
+            "Админ: продавцы",
+            inter.author,
+            "Удален продавец и все его товары",
+            [("Пользователь", f"<@{self.seller_id}>\n`{self.seller_id}`", False), ("Имя", username, True), ("Удалено товаров", str(deleted), True)],
+            COLOR_ERROR,
+        )
+        await inter.response.edit_message(embed=ok_embed("Продавец удален", f"Удалено товаров продавца: {deleted}."), view=None)
+
+
+async def send_product_list_response(inter: disnake.MessageInteraction, products: list[Product], is_admin: bool) -> None:
+    if not products:
+        await inter.response.send_message(embed=error_embed("Товаров пока нет."), ephemeral=True)
+        return
+    lines = [
+        f"`{product.id}` **{product.name}** | {money(product.price)} | "
+        f"{'вечный' if product.is_infinite else f'остаток {product.stock_count}'} | продавец: <@{product.seller_id}>"
+        for product in products[:TEXT_PAGE_SIZE]
+    ]
+    await inter.response.send_message(
+        embed=field_embed(
+            "Список товаров",
+            "ID товаров для изменения и удаления.",
+            [("Товары", short_field("\n".join(lines)), False), ("Показано", f"{min(len(products), TEXT_PAGE_SIZE)} из {len(products)}", True)],
+            COLOR_NEUTRAL,
+            inter.author,
+        ),
+        ephemeral=True,
+    )
+
+
+class ProductDeleteSelectView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, products: list[Product], user_id: int, is_admin: bool, page: int = 0) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.products = products
+        self.user_id = user_id
+        self.is_admin = is_admin
+        self.page = page
+        self.add_item(ProductDeleteSelect(cog, page_slice(products, page, SELECT_PAGE_SIZE), user_id, is_admin))
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def previous_page(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(view=ProductDeleteSelectView(self.cog, self.products, self.user_id, self.is_admin, max(0, self.page - 1)))
+
+    @disnake.ui.button(label="Вперед", style=disnake.ButtonStyle.secondary)
+    async def next_page(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        new_page = min(page_count(len(self.products), SELECT_PAGE_SIZE) - 1, self.page + 1)
+        await inter.response.edit_message(view=ProductDeleteSelectView(self.cog, self.products, self.user_id, self.is_admin, new_page))
+
+
+class ProductDeleteSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, products: list[Product], user_id: int, is_admin: bool) -> None:
+        self.cog = cog
+        self.user_id = user_id
+        self.is_admin = is_admin
+        options = [
+            disnake.SelectOption(
+                label=product.name[:100],
+                value=str(product.id),
+                description=f"ID {product.id} | {money(product.price)} | продавец {product.seller_id}"[:100],
+                emoji="🗑️",
+            )
+            for product in products
+        ]
+        super().__init__(placeholder="Товар", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if inter.author.id != self.user_id:
+            await inter.response.send_message(embed=error_embed("Это меню открыто другим пользователем."), ephemeral=True)
+            return
+        product_id = int(self.values[0])
+        if not await self.cog.can_manage_product(product_id, inter.author.id):
+            await inter.response.send_message(embed=error_embed("Нет доступа к этому товару."), ephemeral=True)
+            return
+        product = await self.cog.store.get_product(product_id)
+        if product is None:
+            await inter.response.send_message(embed=error_embed("Товар не найден."), ephemeral=True)
+            return
+        await self.cog.store.set_product_active(product.id, False)
+        await self.cog.store.log(inter.author.id, "product_delete", f"product={product.id} seller={product.seller_id}")
+        print(f"[product] deleted actor={inter.author.id} product={product.id} seller={product.seller_id}", flush=True)
+        await inter.response.edit_message(embed=ok_embed("Товар удален", f"`{product.id}` {product.name} отключен."), view=None)
 
 
 class PromoCodeModal(disnake.ui.Modal):
@@ -1103,6 +1635,248 @@ class CategoryAdminModal(disnake.ui.Modal):
             await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
 
 
+async def categories_for(cog: ShopCog, user_id: int, is_admin: bool) -> list[Any]:
+    return await cog.store.list_categories_for_seller(user_id, include_all=is_admin and cog.is_admin(user_id))
+
+
+async def subcategories_for(cog: ShopCog, category_id: int, user_id: int, is_admin: bool) -> list[Any]:
+    return await cog.store.list_subcategories_for_seller(category_id, user_id, include_all=is_admin and cog.is_admin(user_id))
+
+
+class AddSubcategoryCategorySelectView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, is_admin: bool, user_id: int) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.is_admin = is_admin
+        self.user_id = user_id
+
+    async def on_timeout(self) -> None:
+        return
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.user_id:
+            await inter.response.send_message(embed=error_embed("Это меню открыто другим пользователем."), ephemeral=True)
+            return False
+        return True
+
+    async def _init_items(self) -> None:
+        if self.children:
+            return
+        categories = await categories_for(self.cog, self.user_id, self.is_admin)
+        self.add_item(AddSubcategoryCategorySelect(self.cog, categories, self.is_admin, self.user_id))
+
+
+class _LazyCategoryView(disnake.ui.View):
+    select_cls: type[disnake.ui.Select]
+
+    def __init__(self, cog: ShopCog, is_admin: bool, user_id: int) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.is_admin = is_admin
+        self.user_id = user_id
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.user_id:
+            await inter.response.send_message(embed=error_embed("Это меню открыто другим пользователем."), ephemeral=True)
+            return False
+        return True
+
+    async def _ensure_select(self) -> None:
+        if self.children:
+            return
+        categories = await categories_for(self.cog, self.user_id, self.is_admin)
+        self.add_item(self.select_cls(self.cog, categories, self.is_admin, self.user_id))
+
+
+class AddSubcategoryCategorySelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, categories: list[Any], is_admin: bool, user_id: int) -> None:
+        self.cog = cog
+        self.is_admin = is_admin
+        self.user_id = user_id
+        options = [disnake.SelectOption(label=str(row["name"])[:100], value=str(row["id"]), emoji="📁") for row in categories[:SELECT_PAGE_SIZE]]
+        if not options:
+            options = [disnake.SelectOption(label="Нет категорий", value="none")]
+        super().__init__(placeholder="Категория", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if self.values[0] == "none":
+            await inter.response.send_message(embed=error_embed("Категорий пока нет."), ephemeral=True)
+            return
+        await inter.response.send_modal(AddSubcategoryModal(self.cog, int(self.values[0]), self.is_admin))
+
+
+class AddSubcategoryModal(disnake.ui.Modal):
+    def __init__(self, cog: ShopCog, category_id: int, is_admin: bool) -> None:
+        self.cog = cog
+        self.category_id = category_id
+        self.is_admin = is_admin
+        super().__init__(title="Добавить подкатегорию", components=[disnake.ui.TextInput(label="Подкатегория", custom_id="name", max_length=80)])
+
+    async def callback(self, inter: disnake.ModalInteraction) -> None:
+        name = inter.text_values["name"].strip()
+        if not name:
+            await inter.response.send_message(embed=error_embed("Название подкатегории обязательно."), ephemeral=True)
+            return
+        owner_id = None if self.is_admin and self.cog.is_admin(inter.author.id) else inter.author.id
+        subcategory_id = await self.cog.store.upsert_subcategory(self.category_id, name, owner_id)
+        await self.cog.store.log(inter.author.id, "subcategory_add", f"category={self.category_id} subcategory={subcategory_id}")
+        await inter.response.send_message(embed=ok_embed("Подкатегория добавлена", f"`{subcategory_id}` {name}"), ephemeral=True)
+
+
+class CategoryDeleteSelectView(_LazyCategoryView):
+    select_cls = None  # type: ignore[assignment]
+
+
+class CategoryDeleteSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, categories: list[Any], is_admin: bool, user_id: int) -> None:
+        self.cog = cog
+        self.user_id = user_id
+        options = [disnake.SelectOption(label=str(row["name"])[:100], value=str(row["id"]), emoji="🗑️") for row in categories[:SELECT_PAGE_SIZE]]
+        if not options:
+            options = [disnake.SelectOption(label="Нет категорий", value="none")]
+        super().__init__(placeholder="Категория", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if self.values[0] == "none":
+            await inter.response.send_message(embed=error_embed("Категорий пока нет."), ephemeral=True)
+            return
+        await self.cog.store.set_category_active(int(self.values[0]), False)
+        await self.cog.store.log(inter.author.id, "category_delete", f"category={self.values[0]}")
+        await inter.response.edit_message(embed=ok_embed("Категория удалена", f"Категория `{self.values[0]}` отключена."), view=None)
+
+
+CategoryDeleteSelectView.select_cls = CategoryDeleteSelect
+
+
+class CategoryRenameSelectView(_LazyCategoryView):
+    select_cls = None  # type: ignore[assignment]
+
+
+class CategoryRenameSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, categories: list[Any], is_admin: bool, user_id: int) -> None:
+        self.cog = cog
+        options = [disnake.SelectOption(label=str(row["name"])[:100], value=str(row["id"]), emoji="✏️") for row in categories[:SELECT_PAGE_SIZE]]
+        if not options:
+            options = [disnake.SelectOption(label="Нет категорий", value="none")]
+        super().__init__(placeholder="Категория", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if self.values[0] == "none":
+            await inter.response.send_message(embed=error_embed("Категорий пока нет."), ephemeral=True)
+            return
+        await inter.response.send_modal(CategoryRenameModal(self.cog, int(self.values[0])))
+
+
+CategoryRenameSelectView.select_cls = CategoryRenameSelect
+
+
+class CategoryRenameModal(disnake.ui.Modal):
+    def __init__(self, cog: ShopCog, category_id: int) -> None:
+        self.cog = cog
+        self.category_id = category_id
+        super().__init__(title="Изменить категорию", components=[disnake.ui.TextInput(label="Новое название", custom_id="name", max_length=80)])
+
+    async def callback(self, inter: disnake.ModalInteraction) -> None:
+        name = inter.text_values["name"].strip()
+        await self.cog.store.rename_category(self.category_id, name)
+        await self.cog.store.log(inter.author.id, "category_rename", f"category={self.category_id}")
+        await inter.response.send_message(embed=ok_embed("Категория изменена", name), ephemeral=True)
+
+
+class SubcategoryDeleteCategorySelectView(_LazyCategoryView):
+    select_cls = None  # type: ignore[assignment]
+
+
+class SubcategoryRenameCategorySelectView(_LazyCategoryView):
+    select_cls = None  # type: ignore[assignment]
+
+
+class _SubcategoryCategorySelect(disnake.ui.Select):
+    mode = "delete"
+
+    def __init__(self, cog: ShopCog, categories: list[Any], is_admin: bool, user_id: int) -> None:
+        self.cog = cog
+        self.is_admin = is_admin
+        self.user_id = user_id
+        options = [disnake.SelectOption(label=str(row["name"])[:100], value=str(row["id"]), emoji="📁") for row in categories[:SELECT_PAGE_SIZE]]
+        if not options:
+            options = [disnake.SelectOption(label="Нет категорий", value="none")]
+        super().__init__(placeholder="Категория", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if self.values[0] == "none":
+            await inter.response.send_message(embed=error_embed("Категорий пока нет."), ephemeral=True)
+            return
+        category_id = int(self.values[0])
+        subcategories = await subcategories_for(self.cog, category_id, self.user_id, self.is_admin)
+        if self.mode == "rename":
+            await inter.response.edit_message(embed=panel_embed("Изменить подкатегорию", "Выберите подкатегорию."), view=SubcategoryRenameSelectView(self.cog, subcategories))
+        else:
+            await inter.response.edit_message(embed=panel_embed("Удалить подкатегорию", "Выберите подкатегорию."), view=SubcategoryDeleteSelectView(self.cog, subcategories))
+
+
+class SubcategoryDeleteCategorySelect(_SubcategoryCategorySelect):
+    mode = "delete"
+
+
+class SubcategoryRenameCategorySelect(_SubcategoryCategorySelect):
+    mode = "rename"
+
+
+SubcategoryDeleteCategorySelectView.select_cls = SubcategoryDeleteCategorySelect
+SubcategoryRenameCategorySelectView.select_cls = SubcategoryRenameCategorySelect
+
+
+class SubcategoryDeleteSelectView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, subcategories: list[Any]) -> None:
+        super().__init__(timeout=180)
+        self.add_item(SubcategoryDeleteSelect(cog, subcategories))
+
+
+class SubcategoryDeleteSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog, subcategories: list[Any]) -> None:
+        self.cog = cog
+        options = [disnake.SelectOption(label=str(row["name"])[:100], value=str(row["id"]), emoji="🧹") for row in subcategories[:SELECT_PAGE_SIZE]]
+        if not options:
+            options = [disnake.SelectOption(label="Нет подкатегорий", value="none")]
+        super().__init__(placeholder="Подкатегория", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if self.values[0] == "none":
+            await inter.response.send_message(embed=error_embed("Подкатегорий пока нет."), ephemeral=True)
+            return
+        await self.cog.store.set_subcategory_active(int(self.values[0]), False)
+        await self.cog.store.log(inter.author.id, "subcategory_delete", f"subcategory={self.values[0]}")
+        await inter.response.edit_message(embed=ok_embed("Подкатегория удалена", f"Подкатегория `{self.values[0]}` отключена."), view=None)
+
+
+class SubcategoryRenameSelectView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, subcategories: list[Any]) -> None:
+        super().__init__(timeout=180)
+        self.add_item(SubcategoryRenameSelect(cog, subcategories))
+
+
+class SubcategoryRenameSelect(SubcategoryDeleteSelect):
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        if self.values[0] == "none":
+            await inter.response.send_message(embed=error_embed("Подкатегорий пока нет."), ephemeral=True)
+            return
+        await inter.response.send_modal(SubcategoryRenameModal(self.cog, int(self.values[0])))
+
+
+class SubcategoryRenameModal(disnake.ui.Modal):
+    def __init__(self, cog: ShopCog, subcategory_id: int) -> None:
+        self.cog = cog
+        self.subcategory_id = subcategory_id
+        super().__init__(title="Изменить подкатегорию", components=[disnake.ui.TextInput(label="Новое название", custom_id="name", max_length=80)])
+
+    async def callback(self, inter: disnake.ModalInteraction) -> None:
+        name = inter.text_values["name"].strip()
+        await self.cog.store.rename_subcategory(self.subcategory_id, name)
+        await self.cog.store.log(inter.author.id, "subcategory_rename", f"subcategory={self.subcategory_id}")
+        await inter.response.send_message(embed=ok_embed("Подкатегория изменена", name), ephemeral=True)
+
+
 class BalanceAdminModal(disnake.ui.Modal):
     def __init__(self, cog: ShopCog, action: str) -> None:
         self.cog = cog
@@ -1182,37 +1956,22 @@ class SellerActionSelect(disnake.ui.Select):
     def __init__(self, cog: ShopCog) -> None:
         self.cog = cog
         options = [
-            disnake.SelectOption(label="Создать товар", value="create", description="Название, описание, цена и тип", emoji="➕"),
-            disnake.SelectOption(label="Создать категорию", value="category_add", description="Категория/подкатегория для товаров", emoji="🗂️"),
-            disnake.SelectOption(label="Добавить сообщение", value="message", description="Payload для товара-сообщения", emoji="✉️"),
-            disnake.SelectOption(label="Редактировать товар", value="edit", description="Название, описание, цена и статус", emoji="✏️"),
+            disnake.SelectOption(label="Изменение товаров", value="products_manage", description="Добавить/изменить/удалить свои товары", emoji="📦"),
+            disnake.SelectOption(label="Изменение категорий", value="categories_manage", description="Добавить/изменить/удалить свои категории", emoji="🗂️"),
             disnake.SelectOption(label="Мои товары", value="products", description="Список ваших активных товаров", emoji="📋"),
-            disnake.SelectOption(label="Добавить файл", value="upload", description="Ожидать файл или HTTPS-ссылку сообщением", emoji="📎"),
         ]
         super().__init__(placeholder="Выберите действие продавца", options=options)
 
     async def callback(self, inter: disnake.MessageInteraction) -> None:
         value = self.values[0]
-        if value == "create":
-            await inter.response.send_message(
-                embed=panel_embed("Создать товар", "Выберите тип товара и настройки выдачи."),
-                view=CreateProductSetupView(self.cog),
-                ephemeral=True,
-            )
-        elif value == "message":
-            await inter.response.send_modal(AddMessageItemModal(self.cog))
-        elif value == "category_add":
-            await inter.response.send_modal(CategoryAdminModal(self.cog, "add"))
-        elif value == "edit":
-            await inter.response.send_message(
-                embed=panel_embed("Редактировать товар", "Выберите статус товара и режим дополнительных файлов."),
-                view=EditProductSetupView(self.cog),
-                ephemeral=True,
-            )
+        if value == "products_manage":
+            is_admin = self.cog.is_admin(inter.author.id)
+            await inter.response.send_message(embed=manage_products_embed(is_admin), view=ProductManagementView(self.cog, is_admin), ephemeral=True)
+        elif value == "categories_manage":
+            is_admin = self.cog.is_admin(inter.author.id)
+            await inter.response.send_message(embed=manage_categories_embed(is_admin), view=CategoryManagementView(self.cog, is_admin), ephemeral=True)
         elif value == "products":
             await self.send_products(inter)
-        elif value == "upload":
-            await inter.response.send_modal(UploadFileModal(self.cog))
 
     async def send_products(self, inter: disnake.MessageInteraction) -> None:
         products = await self.cog.store.list_products_by_seller(inter.author.id)
@@ -1253,11 +2012,12 @@ class UploadFileModal(disnake.ui.Modal):
             if product.product_type != "file":
                 raise ValueError("Этот товар имеет тип сообщения, а не файла.")
 
-            self.cog.pending_uploads[inter.author.id] = product_id
+            channel_id = getattr(inter.channel, "id", 0)
+            self.cog.pending_uploads[inter.author.id] = PendingUpload(inter.author.id, product_id, channel_id, time.time())
             await inter.response.send_message(
                 embed=field_embed(
                     "Ожидаю файл",
-                    "Отправьте следующим сообщением Discord-файл или HTTPS-ссылку. Это работает и в ЛС с ботом.",
+                    "Отправьте следующим сообщением Discord-файл или HTTPS-ссылку в этом же канале/ЛС. Ожидание действует 10 минут.",
                     [
                         ("Товар", f"{product.name}\n`{product.id}`", True),
                         ("Максимум", f"{self.cog.config.max_product_file_mb} МБ", True),
@@ -1765,9 +2525,21 @@ class SubcategorySelect(disnake.ui.Select):
 
 
 class ProductSelectView(disnake.ui.View):
-    def __init__(self, cog: ShopCog, products: list[Product]) -> None:
+    def __init__(self, cog: ShopCog, products: list[Product], page: int = 0) -> None:
         super().__init__(timeout=300)
-        self.add_item(ProductSelect(cog, products))
+        self.cog = cog
+        self.products = products
+        self.page = page
+        self.add_item(ProductSelect(cog, page_slice(products, page, SELECT_PAGE_SIZE)))
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def previous_page(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(view=ProductSelectView(self.cog, self.products, max(0, self.page - 1)))
+
+    @disnake.ui.button(label="Вперед", style=disnake.ButtonStyle.secondary)
+    async def next_page(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        new_page = min(page_count(len(self.products), SELECT_PAGE_SIZE) - 1, self.page + 1)
+        await inter.response.edit_message(view=ProductSelectView(self.cog, self.products, new_page))
 
 
 class ProductSelect(disnake.ui.Select):

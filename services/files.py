@@ -1,14 +1,46 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
+import asyncio
+import ipaddress
 import re
+import socket
 
 import aiohttp
 import disnake
 
 
 SAFE_RE = re.compile(r"[^A-Za-zА-Яа-я0-9._ -]+")
+MAX_REDIRECTS = 10
+ALLOWED_FILE_HOST_DOMAINS = {
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+    "github.com",
+    "raw.githubusercontent.com",
+    "githubusercontent.com",
+    "drive.google.com",
+    "drive.usercontent.google.com",
+    "googleusercontent.com",
+    "dropbox.com",
+    "dl.dropboxusercontent.com",
+    "mega.nz",
+    "mega.io",
+    "disk.yandex.ru",
+    "yadi.sk",
+    "cloud.mail.ru",
+    "1drv.ms",
+    "onedrive.live.com",
+    "gofile.io",
+    "pixeldrain.com",
+    "transfer.sh",
+    "file.io",
+}
+ALLOWED_FILE_HOSTS_LABEL = (
+    "Google Drive, Dropbox, MEGA, Яндекс.Диск, Mail Cloud, OneDrive, GoFile, "
+    "Pixeldrain, Transfer.sh, Discord CDN, GitHub"
+)
+FILE_HOST_ERROR = f"Ссылка должна вести на разрешенный файлообменник. Разрешены: {ALLOWED_FILE_HOSTS_LABEL}."
 
 
 def safe_filename(name: str, fallback: str = "file") -> str:
@@ -68,12 +100,15 @@ async def download_url_payload(
         raise ValueError("Разрешены только HTTPS-ссылки.")
     if not parsed.netloc:
         raise ValueError("Некорректная ссылка.")
+    await _validate_download_url(str(parsed.geturl()))
 
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, allow_redirects=True) as response:
+        response = await _get_with_validated_redirects(session, str(parsed.geturl()))
+        async with response:
             if response.status < 200 or response.status >= 300:
                 raise ValueError(f"Ссылка вернула HTTP {response.status}.")
+            await _validate_download_url(str(response.url))
 
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
@@ -95,6 +130,54 @@ async def download_url_payload(
         target.unlink(missing_ok=True)
         raise ValueError("Файл пустой.")
     return target
+
+
+async def _get_with_validated_redirects(session: aiohttp.ClientSession, url: str) -> aiohttp.ClientResponse:
+    current_url = url
+    for _ in range(MAX_REDIRECTS + 1):
+        await _validate_download_url(current_url)
+        response = await session.get(current_url, allow_redirects=False)
+        if response.status not in {301, 302, 303, 307, 308}:
+            return response
+
+        location = response.headers.get("Location")
+        response.release()
+        if not location:
+            raise ValueError("Ссылка вернула редирект без адреса.")
+        current_url = urljoin(current_url, location)
+    raise ValueError("Слишком много редиректов при скачивании файла.")
+
+
+async def _validate_download_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("Разрешены только HTTPS-ссылки.")
+    host = parsed.hostname.rstrip(".").lower()
+    if not _is_allowed_file_host(host):
+        raise ValueError(FILE_HOST_ERROR)
+    await _reject_private_host(host, parsed.port)
+
+
+def _is_allowed_file_host(host: str) -> bool:
+    return any(host == domain or host.endswith(f".{domain}") for domain in ALLOWED_FILE_HOST_DOMAINS)
+
+
+async def _reject_private_host(host: str, port: int | None = None) -> None:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        addresses = await asyncio.to_thread(socket.getaddrinfo, host, port or 443, type=socket.SOCK_STREAM)
+        ips = {item[4][0] for item in addresses}
+    else:
+        ips = {str(ip)}
+
+    for ip_text in ips:
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except ValueError:
+            raise ValueError("Не удалось проверить адрес ссылки.")
+        if not ip.is_global:
+            raise ValueError("Ссылка ведет на локальный или внутренний адрес.")
 
 
 def _filename_from_response(url: str, response: aiohttp.ClientResponse) -> str:

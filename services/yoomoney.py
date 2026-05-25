@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 import asyncio
@@ -26,6 +27,11 @@ class YooMoneyOperation:
     amount: Decimal
 
 
+def print_payment_log(message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] [payment] {message}", flush=True)
+
+
 def create_quickpay_url(config: BotConfig, invoice: PaymentInvoice) -> str:
     try:
         from yoomoney import Quickpay
@@ -39,6 +45,10 @@ def create_quickpay_url(config: BotConfig, invoice: PaymentInvoice) -> str:
         paymentType=config.yoomoney_payment_type,
         sum=invoice.base_amount,
         label=invoice.label,
+    )
+    print_payment_log(
+        f"YooMoney invoice created: invoice={invoice.id} user={invoice.user_id} "
+        f"base={invoice.base_amount} credited={invoice.amount} promo={invoice.promo_code or '-'}"
     )
     return payment.redirected_url
 
@@ -72,13 +82,23 @@ async def yoomoney_payment_watcher(
         return
 
     client = create_client(config)
+    print_payment_log("YooMoney watcher started")
     while not bot.is_closed():
         try:
+            expired = await store.expire_pending_payment_invoices(24 * 60 * 60)
+            if expired:
+                print_payment_log(f"Expired pending payment invoices: {expired}")
             invoices = await store.list_pending_payment_invoices()
+            print_payment_log(f"YooMoney pending check: {len(invoices)} invoice(s)")
             for invoice in invoices:
+                print_payment_log(f"YooMoney check invoice={invoice.id} label={invoice.label}")
                 operation = await asyncio.to_thread(find_operation_by_label, client, invoice.label)
                 if operation is None:
+                    print_payment_log(f"YooMoney operation not found: invoice={invoice.id}")
                     continue
+                print_payment_log(
+                    f"YooMoney operation found: invoice={invoice.id} operation={operation.operation_id} status={operation.status}"
+                )
                 if operation.status == "success":
                     paid_invoice, credited = await store.mark_yoomoney_invoice_paid(
                         invoice.label,
@@ -87,6 +107,7 @@ async def yoomoney_payment_watcher(
                         f"poll_status={operation.status};operation_amount={operation.amount}",
                     )
                     if credited:
+                        print_payment_log(f"YooMoney credited: invoice={paid_invoice.id} user={paid_invoice.user_id} amount={paid_invoice.amount}")
                         await store.log(
                             paid_invoice.user_id,
                             "yoomoney_paid",
@@ -98,11 +119,16 @@ async def yoomoney_payment_watcher(
                             config,
                             f"YooMoney invoice #{paid_invoice.id} paid: <@{paid_invoice.user_id}> +{money(paid_invoice.amount)}.",
                         )
+                    else:
+                        print_payment_log(f"YooMoney invoice not credited: invoice={paid_invoice.id} status already handled or promo refused")
                 elif operation.status == "refused":
+                    print_payment_log(f"YooMoney refused: invoice={invoice.id} operation={operation.operation_id}")
                     await store.mark_payment_invoice_refused(invoice.label, operation.operation_id)
         except asyncio.CancelledError:
+            print_payment_log("YooMoney watcher stopped")
             raise
-        except Exception:
+        except Exception as exc:
+            print_payment_log(f"YooMoney watcher error: {exc}")
             log.exception("YooMoney payment watcher failed")
         await asyncio.sleep(config.yoomoney_poll_interval_seconds)
 

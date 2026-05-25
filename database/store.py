@@ -79,6 +79,20 @@ class PromoCode:
     created_at: int
 
 
+@dataclass(frozen=True)
+class WithdrawalRequest:
+    id: int
+    seller_id: int
+    seller_name: str
+    amount: int
+    details: str
+    status: str
+    funds_held: bool
+    created_at: int
+    reviewed_by: int | None
+    reviewed_at: int | None
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -240,7 +254,10 @@ class Store:
                 amount INTEGER NOT NULL,
                 details TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
-                created_at INTEGER NOT NULL
+                funds_held INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                reviewed_by INTEGER,
+                reviewed_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS promo_codes (
@@ -277,6 +294,13 @@ class Store:
         await self._add_column_if_missing("payment_invoices", "base_amount", "INTEGER")
         await self._add_column_if_missing("payment_invoices", "promo_code", "TEXT")
         await self._add_column_if_missing("payment_invoices", "promo_bonus_percent", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("payment_invoices", "provider", "TEXT NOT NULL DEFAULT 'yoomoney'")
+        await self._add_column_if_missing("payment_invoices", "operation_id", "TEXT")
+        await self._add_column_if_missing("payment_invoices", "raw_payload", "TEXT")
+        await self._add_column_if_missing("payment_invoices", "paid_at", "INTEGER")
+        await self._add_column_if_missing("withdrawal_requests", "funds_held", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing("withdrawal_requests", "reviewed_by", "INTEGER")
+        await self._add_column_if_missing("withdrawal_requests", "reviewed_at", "INTEGER")
 
     async def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         rows = await self.conn.execute_fetchall(f"PRAGMA table_info({table})")
@@ -331,8 +355,34 @@ class Store:
         await self.conn.execute("DELETE FROM sellers WHERE user_id = ?", (user_id,))
         await self.conn.commit()
 
+    async def remove_seller_and_products(self, user_id: int) -> int:
+        async with self.transaction() as db:
+            rows = await db.execute_fetchall("SELECT id FROM products WHERE seller_id = ?", (user_id,))
+            product_ids = [int(row["id"]) for row in rows]
+            if product_ids:
+                placeholders = ",".join("?" for _ in product_ids)
+                item_rows = await db.execute_fetchall(
+                    f"SELECT id FROM product_items WHERE product_id IN ({placeholders})",
+                    tuple(product_ids),
+                )
+                item_ids = [int(row["id"]) for row in item_rows]
+                if item_ids:
+                    item_placeholders = ",".join("?" for _ in item_ids)
+                    await db.execute(
+                        f"DELETE FROM purchase_items WHERE item_id IN ({item_placeholders})",
+                        tuple(item_ids),
+                    )
+                await db.execute(f"DELETE FROM product_items WHERE product_id IN ({placeholders})", tuple(product_ids))
+                await db.execute(f"DELETE FROM products WHERE id IN ({placeholders})", tuple(product_ids))
+            await db.execute("DELETE FROM sellers WHERE user_id = ?", (user_id,))
+            return len(product_ids)
+
     async def list_sellers(self) -> list[aiosqlite.Row]:
         return await self.conn.execute_fetchall("SELECT * FROM sellers ORDER BY username")
+
+    async def count_products_by_seller(self, seller_id: int) -> int:
+        row = await self.fetchone("SELECT COUNT(*) AS total FROM products WHERE seller_id = ?", (seller_id,))
+        return int(row["total"]) if row else 0
 
     async def upsert_category(self, name: str, owner_id: int | None = None) -> int:
         await self.conn.execute(
@@ -447,6 +497,14 @@ class Store:
         )
         await self.conn.commit()
 
+    async def rename_category(self, category_id: int, name: str) -> None:
+        await self.conn.execute("UPDATE categories SET name = ? WHERE id = ?", (name, category_id))
+        await self.conn.commit()
+
+    async def rename_subcategory(self, subcategory_id: int, name: str) -> None:
+        await self.conn.execute("UPDATE subcategories SET name = ? WHERE id = ?", (name, subcategory_id))
+        await self.conn.commit()
+
     async def create_product(
         self,
         seller_id: int,
@@ -541,6 +599,15 @@ class Store:
     async def set_product_active(self, product_id: int, active: bool) -> None:
         await self.conn.execute("UPDATE products SET is_active = ? WHERE id = ?", (int(active), product_id))
         await self.conn.commit()
+
+    async def clear_all_products(self) -> int:
+        async with self.transaction() as db:
+            row = await self.fetchone("SELECT COUNT(*) AS total FROM products", db=db)
+            total = int(row["total"]) if row else 0
+            await db.execute("DELETE FROM purchase_items")
+            await db.execute("DELETE FROM product_items")
+            await db.execute("DELETE FROM products")
+            return total
 
     async def get_product(self, product_id: int) -> Product | None:
         rows = await self._product_rows("p.id = ?", (product_id,))
@@ -738,16 +805,6 @@ class Store:
             invoice_id = int(cursor.lastrowid)
             label = f"{provider.upper()}{invoice_id}U{user_id}"
             await db.execute("UPDATE payment_invoices SET label = ? WHERE id = ?", (label, invoice_id))
-            if promo is not None:
-                new_used_count = promo.used_count + 1
-                await db.execute(
-                    "INSERT INTO promo_uses(code, user_id, invoice_id, used_at) VALUES(?, ?, ?, ?)",
-                    (promo.code, user_id, invoice_id, now),
-                )
-                await db.execute(
-                    "UPDATE promo_codes SET used_count = ?, is_active = ? WHERE code = ?",
-                    (new_used_count, 0 if new_used_count >= promo.max_uses else 1, promo.code),
-                )
 
         row = await self.fetchone("SELECT * FROM payment_invoices WHERE id = ?", (invoice_id,))
         if row is None:
@@ -755,11 +812,18 @@ class Store:
         return self._payment_invoice_from_row(row)
 
     async def set_payment_invoice_operation(self, invoice_id: int, operation_id: str, raw_payload: str = "") -> None:
-        await self.conn.execute(
-            "UPDATE payment_invoices SET operation_id = ?, raw_payload = ? WHERE id = ?",
-            (operation_id, raw_payload, invoice_id),
-        )
-        await self.conn.commit()
+        async with self.transaction() as db:
+            duplicate = await self.fetchone(
+                "SELECT id FROM payment_invoices WHERE operation_id = ? AND id != ?",
+                (operation_id, invoice_id),
+                db,
+            )
+            if duplicate is not None:
+                raise ValueError("Duplicate payment operation.")
+            await db.execute(
+                "UPDATE payment_invoices SET operation_id = ?, raw_payload = ? WHERE id = ?",
+                (operation_id, raw_payload, invoice_id),
+            )
 
     async def get_payment_invoice_by_label(self, label: str) -> PaymentInvoice | None:
         row = await self.fetchone("SELECT * FROM payment_invoices WHERE label = ?", (label,))
@@ -777,6 +841,15 @@ class Store:
             (provider,),
         )
         return [self._payment_invoice_from_row(row) for row in rows]
+
+    async def expire_pending_payment_invoices(self, max_age_seconds: int) -> int:
+        cutoff = int(time.time()) - max_age_seconds
+        cursor = await self.conn.execute(
+            "UPDATE payment_invoices SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
+            (cutoff,),
+        )
+        await self.conn.commit()
+        return int(cursor.rowcount or 0)
 
     async def mark_payment_invoice_refused(self, label: str, operation_id: str) -> None:
         await self.conn.execute(
@@ -811,6 +884,9 @@ class Store:
             )
             if duplicate is not None:
                 raise ValueError("Duplicate YooMoney operation.")
+            if not await self._consume_invoice_promo(invoice, db):
+                await self._reject_paid_invoice(invoice.id, operation_id, raw_payload, db)
+                return invoice, False
 
             now = int(time.time())
             await db.execute(
@@ -835,6 +911,9 @@ class Store:
             invoice = self._payment_invoice_from_row(row)
             if invoice.status == "paid":
                 return invoice, False
+            if not await self._consume_invoice_promo(invoice, db):
+                await self._reject_paid_invoice(invoice.id, "manual", raw_payload, db)
+                return invoice, False
             now = int(time.time())
             await db.execute(
                 "UPDATE payment_invoices SET status = 'paid', raw_payload = ?, paid_at = ? WHERE id = ?",
@@ -845,6 +924,92 @@ class Store:
                 (invoice.amount, invoice.amount, now, invoice.user_id),
             )
             return invoice, True
+
+    async def mark_cryptopay_invoice_paid(
+        self,
+        invoice_id: int,
+        crypto_invoice_id: str,
+        raw_payload: str,
+    ) -> tuple[PaymentInvoice, bool]:
+        async with self.transaction() as db:
+            row = await self.fetchone("SELECT * FROM payment_invoices WHERE id = ?", (invoice_id,), db)
+            if row is None:
+                raise ValueError("Invoice not found.")
+            invoice = self._payment_invoice_from_row(row)
+            if str(row["provider"]) != "cryptopay":
+                raise ValueError("Invoice is not CryptoPay.")
+            if invoice.status == "paid":
+                return invoice, False
+            if invoice.status != "pending":
+                return invoice, False
+            if str(row["operation_id"]) != str(crypto_invoice_id):
+                raise ValueError("CryptoPay invoice id mismatch.")
+            duplicate = await self.fetchone(
+                "SELECT id FROM payment_invoices WHERE operation_id = ? AND status = 'paid' AND id != ?",
+                (crypto_invoice_id, invoice.id),
+                db,
+            )
+            if duplicate is not None:
+                raise ValueError("Duplicate CryptoPay invoice.")
+            if not await self._consume_invoice_promo(invoice, db):
+                await self._reject_paid_invoice(invoice.id, crypto_invoice_id, raw_payload, db)
+                return invoice, False
+
+            now = int(time.time())
+            await db.execute(
+                """
+                UPDATE payment_invoices
+                SET status = 'paid', raw_payload = ?, paid_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (raw_payload, now, invoice.id),
+            )
+            await db.execute(
+                "UPDATE users SET balance = balance + ?, total_deposited = total_deposited + ?, updated_at = ? WHERE user_id = ?",
+                (invoice.amount, invoice.amount, now, invoice.user_id),
+            )
+            return invoice, True
+
+    async def _consume_invoice_promo(self, invoice: PaymentInvoice, db: aiosqlite.Connection) -> bool:
+        if not invoice.promo_code:
+            return True
+        existing = await self.fetchone(
+            "SELECT 1 FROM promo_uses WHERE code = ? AND user_id = ?",
+            (invoice.promo_code, invoice.user_id),
+            db,
+        )
+        if existing is not None:
+            return False
+        promo = await self.get_active_promo_code(invoice.promo_code, db)
+        if promo is None:
+            return False
+        now = int(time.time())
+        new_used_count = promo.used_count + 1
+        await db.execute(
+            "INSERT INTO promo_uses(code, user_id, invoice_id, used_at) VALUES(?, ?, ?, ?)",
+            (promo.code, invoice.user_id, invoice.id, now),
+        )
+        await db.execute(
+            "UPDATE promo_codes SET used_count = ?, is_active = ? WHERE code = ?",
+            (new_used_count, 0 if new_used_count >= promo.max_uses else 1, promo.code),
+        )
+        return True
+
+    async def _reject_paid_invoice(
+        self,
+        invoice_id: int,
+        operation_id: str,
+        raw_payload: str,
+        db: aiosqlite.Connection,
+    ) -> None:
+        await db.execute(
+            """
+            UPDATE payment_invoices
+            SET status = 'refused', operation_id = ?, raw_payload = ?, paid_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (operation_id, raw_payload, int(time.time()), invoice_id),
+        )
 
     async def log(self, actor_id: int, action: str, details: str) -> None:
         await self.conn.execute(
@@ -863,16 +1028,97 @@ class Store:
         )
         return int(row["last_sale"]) if row and row["last_sale"] is not None else None
 
-    async def create_withdrawal_request(self, seller_id: int, seller_name: str, amount: int, details: str) -> int:
-        cursor = await self.conn.execute(
-            """
-            INSERT INTO withdrawal_requests(seller_id, seller_name, amount, details, created_at)
-            VALUES(?, ?, ?, ?, ?)
-            """,
-            (seller_id, seller_name, amount, details, int(time.time())),
+    def _withdrawal_from_row(self, row: aiosqlite.Row) -> WithdrawalRequest:
+        return WithdrawalRequest(
+            id=int(row["id"]),
+            seller_id=int(row["seller_id"]),
+            seller_name=str(row["seller_name"]),
+            amount=int(row["amount"]),
+            details=str(row["details"]),
+            status=str(row["status"]),
+            funds_held=bool(row["funds_held"]),
+            created_at=int(row["created_at"]),
+            reviewed_by=int(row["reviewed_by"]) if row["reviewed_by"] is not None else None,
+            reviewed_at=int(row["reviewed_at"]) if row["reviewed_at"] is not None else None,
         )
-        await self.conn.commit()
-        return int(cursor.lastrowid)
+
+    async def get_withdrawal_request(self, request_id: int) -> WithdrawalRequest | None:
+        row = await self.fetchone("SELECT * FROM withdrawal_requests WHERE id = ?", (request_id,))
+        return self._withdrawal_from_row(row) if row else None
+
+    async def create_withdrawal_request(self, seller_id: int, seller_name: str, amount: int, details: str) -> int:
+        await self.ensure_user(seller_id, seller_name)
+        async with self.transaction() as db:
+            pending = await self.fetchone(
+                "SELECT COALESCE(SUM(amount), 0) AS total FROM withdrawal_requests WHERE seller_id = ? AND status = 'pending'",
+                (seller_id,),
+                db,
+            )
+            balance_row = await self.fetchone("SELECT balance FROM users WHERE user_id = ?", (seller_id,), db)
+            available = int(balance_row["balance"]) if balance_row else 0
+            blocked = int(pending["total"]) if pending else 0
+            if amount <= 0:
+                raise ValueError("Сумма вывода должна быть больше нуля.")
+            if available < amount:
+                raise ValueError("Недостаточно средств для вывода.")
+            if blocked:
+                raise ValueError("У вас уже есть заявка на вывод. Дождитесь решения администратора.")
+            now = int(time.time())
+            await db.execute("UPDATE users SET balance = balance - ?, updated_at = ? WHERE user_id = ?", (amount, now, seller_id))
+            cursor = await db.execute(
+                """
+                INSERT INTO withdrawal_requests(seller_id, seller_name, amount, details, status, funds_held, created_at)
+                VALUES(?, ?, ?, ?, 'pending', 1, ?)
+                """,
+                (seller_id, seller_name, amount, details, now),
+            )
+            return int(cursor.lastrowid)
+
+    async def approve_withdrawal_request(self, request_id: int, admin_id: int) -> WithdrawalRequest:
+        async with self.transaction() as db:
+            row = await self.fetchone("SELECT * FROM withdrawal_requests WHERE id = ?", (request_id,), db)
+            if row is None:
+                raise ValueError("Заявка на вывод не найдена.")
+            request = self._withdrawal_from_row(row)
+            if request.status != "pending":
+                raise ValueError("Заявка уже обработана.")
+            now = int(time.time())
+            if not request.funds_held:
+                balance_row = await self.fetchone("SELECT balance FROM users WHERE user_id = ?", (request.seller_id,), db)
+                if balance_row is None or int(balance_row["balance"]) < request.amount:
+                    raise ValueError("Недостаточно средств для подтверждения старой заявки.")
+                await db.execute("UPDATE users SET balance = balance - ?, updated_at = ? WHERE user_id = ?", (request.amount, now, request.seller_id))
+            await db.execute(
+                "UPDATE withdrawal_requests SET status = 'approved', funds_held = 0, reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+                (admin_id, now, request_id),
+            )
+        result = await self.get_withdrawal_request(request_id)
+        if result is None:
+            raise ValueError("Заявка на вывод не найдена.")
+        return result
+
+    async def reject_withdrawal_request(self, request_id: int, admin_id: int) -> WithdrawalRequest:
+        async with self.transaction() as db:
+            row = await self.fetchone("SELECT * FROM withdrawal_requests WHERE id = ?", (request_id,), db)
+            if row is None:
+                raise ValueError("Заявка на вывод не найдена.")
+            request = self._withdrawal_from_row(row)
+            if request.status != "pending":
+                raise ValueError("Заявка уже обработана.")
+            now = int(time.time())
+            if request.funds_held:
+                await db.execute(
+                    "UPDATE users SET balance = balance + ?, updated_at = ? WHERE user_id = ?",
+                    (request.amount, now, request.seller_id),
+                )
+            await db.execute(
+                "UPDATE withdrawal_requests SET status = 'rejected', funds_held = 0, reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+                (admin_id, now, request_id),
+            )
+        result = await self.get_withdrawal_request(request_id)
+        if result is None:
+            raise ValueError("Заявка на вывод не найдена.")
+        return result
 
     async def reserve_purchase(
         self,
