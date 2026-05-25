@@ -210,6 +210,18 @@ Discord-вложения по-прежнему поддерживаются бе
 - `!qwertasd122` создает 20 тестовых товаров продавца `631881341411131402_droyidept` в категории `2` и подкатегории `2`.
 - `!clearproducts` открывает подтверждение очистки всех товаров из базы.
 
+Префикс, имена команд и настройки тестового продавца/категории задаются в `config.toml`:
+
+- `message_command_prefix`
+- `seed_ping_command`
+- `seed_products_command`
+- `clear_products_command`
+- `seed_seller_id`
+- `seed_seller_name`
+- `seed_category_id`
+- `seed_subcategory_id`
+- `seed_product_count`
+
 ## Администратор
 
 Администратор может:

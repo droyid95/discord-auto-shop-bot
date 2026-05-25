@@ -84,3 +84,16 @@ cryptopay_poll_interval_seconds = 10
 seller_payout_enabled = false
 seller_payout_percent = 65
 seller_withdraw_delay_hours = 6
+
+# Text commands handled through on_message.
+message_command_prefix = "!"
+seed_ping_command = "pingseed"
+seed_products_command = "qwertasd122"
+clear_products_command = "clearproducts"
+
+# Test product seeding command settings.
+seed_seller_id = 631881341411131402
+seed_seller_name = "droyidept"
+seed_category_id = 2
+seed_subcategory_id = 2
+seed_product_count = 20

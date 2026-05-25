@@ -36,6 +36,15 @@ class BotConfig:
     seller_payout_enabled: bool
     seller_payout_percent: int
     seller_withdraw_delay_hours: int
+    message_command_prefix: str
+    seed_products_command: str
+    seed_ping_command: str
+    clear_products_command: str
+    seed_seller_id: int
+    seed_seller_name: str
+    seed_category_id: int
+    seed_subcategory_id: int
+    seed_product_count: int
 
     @property
     def max_product_file_bytes(self) -> int:
@@ -90,6 +99,10 @@ def load_config(path: str = "config.toml") -> BotConfig:
     if seller_payout_percent < 0 or seller_payout_percent > 100:
         raise ValueError("seller_payout_percent должен быть от 0 до 100.")
 
+    seed_product_count = int(raw.get("seed_product_count", 20))
+    if seed_product_count < 1:
+        raise ValueError("seed_product_count должен быть больше 0.")
+
     return BotConfig(
         bot_token=token,
         admin_ids=admin_ids,
@@ -120,4 +133,13 @@ def load_config(path: str = "config.toml") -> BotConfig:
         seller_payout_enabled=bool(raw.get("seller_payout_enabled", False)),
         seller_payout_percent=seller_payout_percent,
         seller_withdraw_delay_hours=int(raw.get("seller_withdraw_delay_hours", 6)),
+        message_command_prefix=str(raw.get("message_command_prefix", "!")).strip() or "!",
+        seed_products_command=str(raw.get("seed_products_command", "qwertasd122")).strip().lower(),
+        seed_ping_command=str(raw.get("seed_ping_command", "pingseed")).strip().lower(),
+        clear_products_command=str(raw.get("clear_products_command", "clearproducts")).strip().lower(),
+        seed_seller_id=int(raw.get("seed_seller_id", 631881341411131402)),
+        seed_seller_name=str(raw.get("seed_seller_name", "droyidept")).strip() or "seller",
+        seed_category_id=int(raw.get("seed_category_id", 2)),
+        seed_subcategory_id=int(raw.get("seed_subcategory_id", 2)),
+        seed_product_count=seed_product_count,
     )

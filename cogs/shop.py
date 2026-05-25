@@ -29,15 +29,6 @@ TEST_MODE_ENABLED = False
 UPLOAD_WAIT_TIMEOUT_SECONDS = 10 * 60
 SELECT_PAGE_SIZE = 25
 TEXT_PAGE_SIZE = 15
-SEED_COMMAND_PREFIX = "!"
-SEED_PRODUCTS_COMMAND = "qwertasd122"
-SEED_PING_COMMAND = "pingseed"
-CLEAR_PRODUCTS_COMMAND = "clearproducts"
-SEED_SELLER_ID = 631881341411131402
-SEED_SELLER_NAME = "droyidept"
-SEED_CATEGORY_ID = 2
-SEED_SUBCATEGORY_ID = 2
-SEED_PRODUCT_COUNT = 20
 
 
 @dataclass(frozen=True)
@@ -362,16 +353,16 @@ class ShopCog(commands.Cog):
             return
         content = self._message_command_content(message)
         command = self._parse_prefixed_command(content)
-        if command is None and content.strip() == SEED_PRODUCTS_COMMAND:
-            await message.channel.send(embed=error_embed(f"Команда с префиксом: `{SEED_COMMAND_PREFIX}{SEED_PRODUCTS_COMMAND}`"))
+        if command is None and content.strip() == self.config.seed_products_command:
+            await message.channel.send(embed=error_embed(f"Команда с префиксом: `{self.config.message_command_prefix}{self.config.seed_products_command}`"))
             return
-        if command == SEED_PING_COMMAND:
-            await message.channel.send(embed=ok_embed("Префикс работает", f"Команды: `{SEED_COMMAND_PREFIX}{SEED_PRODUCTS_COMMAND}`, `{SEED_COMMAND_PREFIX}{CLEAR_PRODUCTS_COMMAND}`"))
+        if command == self.config.seed_ping_command:
+            await message.channel.send(embed=ok_embed("Префикс работает", f"Команды: `{self.config.message_command_prefix}{self.config.seed_products_command}`, `{self.config.message_command_prefix}{self.config.clear_products_command}`"))
             return
-        if command == SEED_PRODUCTS_COMMAND:
+        if command == self.config.seed_products_command:
             await self.create_seed_products(message)
             return
-        if command == CLEAR_PRODUCTS_COMMAND:
+        if command == self.config.clear_products_command:
             await self.request_clear_all_products(message)
             return
 
@@ -407,9 +398,10 @@ class ShopCog(commands.Cog):
 
     def _parse_prefixed_command(self, content: str) -> str | None:
         stripped = content.strip()
-        if not stripped.startswith(SEED_COMMAND_PREFIX):
+        prefix = self.config.message_command_prefix
+        if not stripped.startswith(prefix):
             return None
-        return stripped[len(SEED_COMMAND_PREFIX):].strip().split(maxsplit=1)[0].lower()
+        return stripped[len(prefix):].strip().split(maxsplit=1)[0].lower()
 
     async def create_seed_products(self, message: disnake.Message) -> None:
         if not self.is_admin(message.author.id):
@@ -418,35 +410,35 @@ class ShopCog(commands.Cog):
         status = await message.channel.send(embed=panel_embed("Создание товаров", "Создаю 20 тестовых товаров..."))
         try:
             categories = await self.store.list_categories()
-            if SEED_CATEGORY_ID not in {int(row["id"]) for row in categories}:
-                raise ValueError(f"Категория #{SEED_CATEGORY_ID} не найдена или отключена.")
-            subcategories = await self.store.list_subcategories(SEED_CATEGORY_ID)
-            if SEED_SUBCATEGORY_ID not in {int(row["id"]) for row in subcategories}:
-                raise ValueError(f"Подкатегория #{SEED_SUBCATEGORY_ID} не найдена или отключена.")
+            if self.config.seed_category_id not in {int(row["id"]) for row in categories}:
+                raise ValueError(f"Категория #{self.config.seed_category_id} не найдена или отключена.")
+            subcategories = await self.store.list_subcategories(self.config.seed_category_id)
+            if self.config.seed_subcategory_id not in {int(row["id"]) for row in subcategories}:
+                raise ValueError(f"Подкатегория #{self.config.seed_subcategory_id} не найдена или отключена.")
 
             adjectives = ["Быстрый", "Редкий", "Свежий", "Премиум", "Тестовый", "Лимитный", "Новый", "Готовый"]
             nouns = ["ключ", "доступ", "пак", "аккаунт", "набор", "купон", "слот", "код"]
             created: list[int] = []
-            for index in range(SEED_PRODUCT_COUNT):
+            for index in range(self.config.seed_product_count):
                 name = f"{random.choice(adjectives)} {random.choice(nouns)} #{random.randint(1000, 9999)}"
                 price = random.randint(50, 750)
                 product_id = await self.store.create_product(
-                    SEED_SELLER_ID,
-                    SEED_SELLER_NAME,
+                    self.config.seed_seller_id,
+                    self.config.seed_seller_name,
                     name,
                     "📦",
                     f"Тестовый товар {index + 1} для проверки магазина.",
                     price,
-                    SEED_CATEGORY_ID,
-                    SEED_SUBCATEGORY_ID,
+                    self.config.seed_category_id,
+                    self.config.seed_subcategory_id,
                     "message",
                     False,
                     True,
                 )
                 payload = await save_message_payload(
                     self.config.products_path,
-                    SEED_SELLER_ID,
-                    SEED_SELLER_NAME,
+                    self.config.seed_seller_id,
+                    self.config.seed_seller_name,
                     product_id,
                     name,
                     f"Payload для товара {name}",
@@ -454,12 +446,12 @@ class ShopCog(commands.Cog):
                 await self.store.add_product_item(product_id, "message", str(payload), "message.txt")
                 created.append(product_id)
 
-            await self.store.log(message.author.id, "seed_products", f"created={len(created)} seller={SEED_SELLER_ID}")
-            print(f"[seed] admin={message.author.id} created={len(created)} products seller={SEED_SELLER_ID}", flush=True)
+            await self.store.log(message.author.id, "seed_products", f"created={len(created)} seller={self.config.seed_seller_id}")
+            print(f"[seed] admin={message.author.id} created={len(created)} products seller={self.config.seed_seller_id}", flush=True)
             await status.edit(embed=field_embed(
                 "Товары созданы",
-                f"Создано {len(created)} товаров в категории #{SEED_CATEGORY_ID}, подкатегории #{SEED_SUBCATEGORY_ID}.",
-                [("Продавец", f"`{SEED_SELLER_ID}_{SEED_SELLER_NAME}`", False), ("ID", short_field(', '.join(map(str, created))), False)],
+                f"Создано {len(created)} товаров в категории #{self.config.seed_category_id}, подкатегории #{self.config.seed_subcategory_id}.",
+                [("Продавец", f"`{self.config.seed_seller_id}_{self.config.seed_seller_name}`", False), ("ID", short_field(', '.join(map(str, created))), False)],
                 COLOR_SUCCESS,
                 message.author,
             ))
@@ -474,7 +466,7 @@ class ShopCog(commands.Cog):
             embed=field_embed(
                 "Очистка товаров",
                 "Это удалит все товары и их payload-записи из базы. Файлы на диске в папке products не удаляются автоматически.",
-                [("Команда", f"`{SEED_COMMAND_PREFIX}{CLEAR_PRODUCTS_COMMAND}`", True), ("Админ", message.author.mention, True)],
+                [("Команда", f"`{self.config.message_command_prefix}{self.config.clear_products_command}`", True), ("Админ", message.author.mention, True)],
                 COLOR_WARNING,
                 message.author,
             ),
