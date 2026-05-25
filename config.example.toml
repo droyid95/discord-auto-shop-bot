@@ -22,6 +22,20 @@ products_path = "products"
 # Max product file size for Discord attachments and HTTPS downloads.
 max_product_file_mb = 350
 
+# Embed colors in RGB format.
+color_primary_rgb = [88, 101, 242]
+color_neutral_rgb = [43, 45, 49]
+color_success_rgb = [46, 204, 113]
+color_warning_rgb = [241, 196, 15]
+color_error_rgb = [231, 76, 60]
+color_payment_rgb = [26, 188, 156]
+footer_text = "AutoShop"
+
+# UX limits and timeouts.
+upload_wait_timeout_seconds = 600
+select_page_size = 25
+text_page_size = 15
+
 # Bot status:
 # 1 - Активен
 # 2 - Не беспокоить

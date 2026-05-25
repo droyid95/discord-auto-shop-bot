@@ -45,6 +45,16 @@ class BotConfig:
     seed_category_id: int
     seed_subcategory_id: int
     seed_product_count: int
+    color_primary: int
+    color_neutral: int
+    color_success: int
+    color_warning: int
+    color_error: int
+    color_payment: int
+    footer_text: str
+    upload_wait_timeout_seconds: int
+    select_page_size: int
+    text_page_size: int
 
     @property
     def max_product_file_bytes(self) -> int:
@@ -103,6 +113,18 @@ def load_config(path: str = "config.toml") -> BotConfig:
     if seed_product_count < 1:
         raise ValueError("seed_product_count должен быть больше 0.")
 
+    upload_wait_timeout_seconds = int(raw.get("upload_wait_timeout_seconds", 10 * 60))
+    if upload_wait_timeout_seconds < 1:
+        raise ValueError("upload_wait_timeout_seconds должен быть больше 0.")
+
+    select_page_size = int(raw.get("select_page_size", 25))
+    if select_page_size < 1 or select_page_size > 25:
+        raise ValueError("select_page_size должен быть от 1 до 25.")
+
+    text_page_size = int(raw.get("text_page_size", 15))
+    if text_page_size < 1:
+        raise ValueError("text_page_size должен быть больше 0.")
+
     return BotConfig(
         bot_token=token,
         admin_ids=admin_ids,
@@ -142,4 +164,24 @@ def load_config(path: str = "config.toml") -> BotConfig:
         seed_category_id=int(raw.get("seed_category_id", 2)),
         seed_subcategory_id=int(raw.get("seed_subcategory_id", 2)),
         seed_product_count=seed_product_count,
+        color_primary=rgb_to_int(raw.get("color_primary_rgb", [88, 101, 242]), "color_primary_rgb"),
+        color_neutral=rgb_to_int(raw.get("color_neutral_rgb", [43, 45, 49]), "color_neutral_rgb"),
+        color_success=rgb_to_int(raw.get("color_success_rgb", [46, 204, 113]), "color_success_rgb"),
+        color_warning=rgb_to_int(raw.get("color_warning_rgb", [241, 196, 15]), "color_warning_rgb"),
+        color_error=rgb_to_int(raw.get("color_error_rgb", [231, 76, 60]), "color_error_rgb"),
+        color_payment=rgb_to_int(raw.get("color_payment_rgb", [26, 188, 156]), "color_payment_rgb"),
+        footer_text=str(raw.get("footer_text", "AutoShop")),
+        upload_wait_timeout_seconds=upload_wait_timeout_seconds,
+        select_page_size=select_page_size,
+        text_page_size=text_page_size,
     )
+
+
+def rgb_to_int(value: object, field_name: str) -> int:
+    if not isinstance(value, list | tuple) or len(value) != 3:
+        raise ValueError(f"{field_name} должен быть RGB-массивом: [R, G, B].")
+    red, green, blue = (int(part) for part in value)
+    for part in (red, green, blue):
+        if part < 0 or part > 255:
+            raise ValueError(f"{field_name} должен содержать числа от 0 до 255.")
+    return (red << 16) + (green << 8) + blue

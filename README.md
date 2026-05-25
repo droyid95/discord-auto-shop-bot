@@ -222,6 +222,19 @@ Discord-вложения по-прежнему поддерживаются бе
 - `seed_subcategory_id`
 - `seed_product_count`
 
+Настройки эмбедов и UX-лимитов тоже находятся в `config.toml`. Цвета задаются RGB-массивами:
+
+- `color_primary_rgb = [88, 101, 242]`
+- `color_neutral_rgb = [43, 45, 49]`
+- `color_success_rgb = [46, 204, 113]`
+- `color_warning_rgb = [241, 196, 15]`
+- `color_error_rgb = [231, 76, 60]`
+- `color_payment_rgb = [26, 188, 156]`
+- `footer_text`
+- `upload_wait_timeout_seconds`
+- `select_page_size`
+- `text_page_size`
+
 ## Администратор
 
 Администратор может:

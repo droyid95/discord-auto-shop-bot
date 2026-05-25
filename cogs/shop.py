@@ -18,17 +18,17 @@ from services.yoomoney import create_quickpay_url, print_payment_log
 from utils import money, parse_bool, parse_int
 
 
-COLOR_PRIMARY = 0x5865F2
-COLOR_NEUTRAL = 0x2B2D31
-COLOR_SUCCESS = 0x2ECC71
-COLOR_WARNING = 0xF1C40F
-COLOR_ERROR = 0xE74C3C
-COLOR_PAYMENT = 0x1ABC9C
-FOOTER_TEXT = "AutoShop"
+COLOR_PRIMARY = 0
+COLOR_NEUTRAL = 0
+COLOR_SUCCESS = 0
+COLOR_WARNING = 0
+COLOR_ERROR = 0
+COLOR_PAYMENT = 0
+FOOTER_TEXT = ""
 TEST_MODE_ENABLED = False
-UPLOAD_WAIT_TIMEOUT_SECONDS = 10 * 60
-SELECT_PAGE_SIZE = 25
-TEXT_PAGE_SIZE = 15
+UPLOAD_WAIT_TIMEOUT_SECONDS = 0
+SELECT_PAGE_SIZE = 1
+TEXT_PAGE_SIZE = 1
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,24 @@ def avatar_url(user: disnake.User | disnake.Member | None) -> str | None:
     return str(user.display_avatar.url) if user else None
 
 
-def panel_embed(title: str, description: str, color: int = COLOR_NEUTRAL) -> disnake.Embed:
-    embed = disnake.Embed(title=title, description=description, color=color)
+def apply_shop_config(config: BotConfig) -> None:
+    global COLOR_PRIMARY, COLOR_NEUTRAL, COLOR_SUCCESS, COLOR_WARNING, COLOR_ERROR, COLOR_PAYMENT
+    global FOOTER_TEXT, TEST_MODE_ENABLED, UPLOAD_WAIT_TIMEOUT_SECONDS, SELECT_PAGE_SIZE, TEXT_PAGE_SIZE
+    COLOR_PRIMARY = config.color_primary
+    COLOR_NEUTRAL = config.color_neutral
+    COLOR_SUCCESS = config.color_success
+    COLOR_WARNING = config.color_warning
+    COLOR_ERROR = config.color_error
+    COLOR_PAYMENT = config.color_payment
+    FOOTER_TEXT = config.footer_text
+    TEST_MODE_ENABLED = config.test_mode
+    UPLOAD_WAIT_TIMEOUT_SECONDS = config.upload_wait_timeout_seconds
+    SELECT_PAGE_SIZE = config.select_page_size
+    TEXT_PAGE_SIZE = config.text_page_size
+
+
+def panel_embed(title: str, description: str, color: int | None = None) -> disnake.Embed:
+    embed = disnake.Embed(title=title, description=description, color=COLOR_NEUTRAL if color is None else color)
     if TEST_MODE_ENABLED:
         embed.add_field(name="Тестовый режим", value="Бот работает в test-mode.", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
@@ -71,7 +87,7 @@ def field_embed(
     title: str,
     description: str,
     fields: list[tuple[str, str, bool]] | None = None,
-    color: int = COLOR_NEUTRAL,
+    color: int | None = None,
     user: disnake.User | disnake.Member | None = None,
 ) -> disnake.Embed:
     embed = set_thumb(panel_embed(title, description, color), user)
@@ -104,8 +120,7 @@ class ShopCog(commands.Cog):
         self.store = store
         self.config = config
         self.pending_uploads: dict[int, PendingUpload] = {}
-        global TEST_MODE_ENABLED
-        TEST_MODE_ENABLED = config.test_mode
+        apply_shop_config(config)
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.config.admin_ids
