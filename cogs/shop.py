@@ -11,7 +11,7 @@ import disnake
 from disnake.ext import commands
 
 from config import BotConfig
-from database.store import Product, PurchaseRecord, Store, WithdrawalRequest
+from database.store import Product, PromoCode, PurchaseRecord, Store, WithdrawalRequest
 from services.files import download_url_payload, save_attachment_payload, save_message_payload
 from services.cryptopay import CryptoPaymentLinkView, create_crypto_invoice
 from services.yoomoney import create_quickpay_url, print_payment_log
@@ -1002,6 +1002,89 @@ def manage_categories_embed(is_admin: bool) -> disnake.Embed:
     return panel_embed("Изменение категорий", f"Здесь можно добавлять, изменять и удалять категории/подкатегории. Доступны {scope}.", COLOR_NEUTRAL)
 
 
+def manage_balance_embed() -> disnake.Embed:
+    return panel_embed("Изменение баланса", "Выберите действие с балансом пользователя.", COLOR_WARNING)
+
+
+def manage_promo_embed() -> disnake.Embed:
+    return panel_embed("Изменение промокода", "Список, создание, изменение, отключение и удаление промокодов.", COLOR_WARNING)
+
+
+class BalanceManagementView(disnake.ui.View):
+    def __init__(self, cog: ShopCog) -> None:
+        super().__init__(timeout=300)
+        self.add_item(BalanceManagementSelect(cog))
+
+
+class BalanceManagementSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog) -> None:
+        self.cog = cog
+        options = [
+            disnake.SelectOption(label="Выдать баланс", value="add", description="Добавить сумму пользователю", emoji="💵"),
+            disnake.SelectOption(label="Поставить баланс", value="set", description="Задать точный баланс", emoji="🧾"),
+            disnake.SelectOption(label="Снять баланс", value="remove", description="Вычесть сумму у пользователя", emoji="📉"),
+        ]
+        super().__init__(placeholder="Действие с балансом", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        await inter.response.send_modal(BalanceAdminModal(self.cog, self.values[0]))
+
+
+class PromoManagementView(disnake.ui.View):
+    def __init__(self, cog: ShopCog) -> None:
+        super().__init__(timeout=300)
+        self.add_item(PromoManagementSelect(cog))
+
+
+class PromoManagementSelect(disnake.ui.Select):
+    def __init__(self, cog: ShopCog) -> None:
+        self.cog = cog
+        options = [
+            disnake.SelectOption(label="Список", value="list", description="Показать все промокоды", emoji="📋"),
+            disnake.SelectOption(label="Создать", value="create", description="Создать новый промокод", emoji="➕"),
+            disnake.SelectOption(label="Изменить", value="edit", description="Изменить процент и лимит", emoji="✏️"),
+            disnake.SelectOption(label="Убрать", value="disable", description="Отключить: при вводе будет 'Промокод истек'", emoji="⏸️"),
+            disnake.SelectOption(label="Удалить", value="delete", description="Удалить промокод из базы данных", emoji="🗑️"),
+        ]
+        super().__init__(placeholder="Действие с промокодом", options=options)
+
+    async def callback(self, inter: disnake.MessageInteraction) -> None:
+        value = self.values[0]
+        if value == "list":
+            await send_promo_list(self.cog, inter)
+        elif value == "create":
+            await inter.response.send_modal(PromoCodeModal(self.cog))
+        elif value == "edit":
+            await inter.response.send_modal(PromoEditModal(self.cog))
+        elif value == "disable":
+            await inter.response.send_modal(PromoCodeActionModal(self.cog, "disable"))
+        elif value == "delete":
+            await inter.response.send_modal(PromoCodeActionModal(self.cog, "delete"))
+
+
+async def send_promo_list(cog: ShopCog, inter: disnake.MessageInteraction) -> None:
+    promos = await cog.store.list_promo_codes()
+    if not promos:
+        await inter.response.send_message(embed=error_embed("Промокодов пока нет."), ephemeral=True)
+        return
+    lines = [promo_line(promo) for promo in promos[:TEXT_PAGE_SIZE]]
+    await inter.response.send_message(
+        embed=field_embed(
+            "Промокоды",
+            "Список промокодов в базе.",
+            [("Промокоды", short_field("\n".join(lines)), False), ("Показано", f"{min(len(promos), TEXT_PAGE_SIZE)} из {len(promos)}", True)],
+            COLOR_NEUTRAL,
+            inter.author,
+        ),
+        ephemeral=True,
+    )
+
+
+def promo_line(promo: PromoCode) -> str:
+    status = "активен" if promo.is_active and promo.used_count < promo.max_uses else "истек"
+    return f"`{promo.code}` | +{promo.bonus_percent}% | {promo.used_count}/{promo.max_uses} | {status}"
+
+
 class ProductManagementView(disnake.ui.View):
     def __init__(self, cog: ShopCog, is_admin: bool) -> None:
         super().__init__(timeout=300)
@@ -1120,10 +1203,8 @@ class AdminActionSelect(disnake.ui.Select):
             disnake.SelectOption(label="Удалить продавца", value="seller_remove", description="Выбрать продавца из списка и удалить с товарами", emoji="➖"),
             disnake.SelectOption(label="Изменение товаров", value="products_manage", description="Список, изменение и удаление товаров", emoji="📦"),
             disnake.SelectOption(label="Изменение категорий", value="categories_manage", description="Добавить/изменить/удалить категории и подкатегории", emoji="🗂️"),
-            disnake.SelectOption(label="Выдать баланс", value="balance_add", description="Добавить сумму пользователю", emoji="💵"),
-            disnake.SelectOption(label="Поставить баланс", value="balance_set", description="Задать точный баланс", emoji="🧾"),
-            disnake.SelectOption(label="Снять баланс", value="balance_remove", description="Вычесть сумму у пользователя", emoji="📉"),
-            disnake.SelectOption(label="Создать промокод", value="promo_create", description="Бонус к пополнению в процентах", emoji="🎟️"),
+            disnake.SelectOption(label="Изменение баланса", value="balance_manage", description="Выдать, поставить или снять баланс", emoji="💵"),
+            disnake.SelectOption(label="Изменение промокода", value="promo_manage", description="Список, создать, изменить, убрать или удалить", emoji="🎟️"),
             disnake.SelectOption(label="Сделать себя продавцом", value="self_seller", description="Добавить себя в продавцы", emoji="⭐"),
         ]
         super().__init__(placeholder="Выберите админ-действие", options=options)
@@ -1138,10 +1219,10 @@ class AdminActionSelect(disnake.ui.Select):
             await inter.response.send_message(embed=manage_products_embed(True), view=ProductManagementView(self.cog, True), ephemeral=True)
         elif value == "categories_manage":
             await inter.response.send_message(embed=manage_categories_embed(True), view=CategoryManagementView(self.cog, True), ephemeral=True)
-        elif value.startswith("balance_"):
-            await inter.response.send_modal(BalanceAdminModal(self.cog, value.removeprefix("balance_")))
-        elif value == "promo_create":
-            await inter.response.send_modal(PromoCodeModal(self.cog))
+        elif value == "balance_manage":
+            await inter.response.send_message(embed=manage_balance_embed(), view=BalanceManagementView(self.cog), ephemeral=True)
+        elif value == "promo_manage":
+            await inter.response.send_message(embed=manage_promo_embed(), view=PromoManagementView(self.cog), ephemeral=True)
         elif value == "self_seller":
             await self.cog.store.add_seller(inter.author.id, str(inter.author))
             await self.cog.store.log(inter.author.id, "self_seller", "admin added self as seller")
@@ -1406,6 +1487,96 @@ class PromoCodeModal(disnake.ui.Modal):
                         ("Бонус", f"+{promo.bonus_percent}%", True),
                         ("Лимит", str(promo.max_uses), True),
                     ],
+                    COLOR_SUCCESS,
+                    inter.author,
+                ),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
+
+
+class PromoEditModal(disnake.ui.Modal):
+    def __init__(self, cog: ShopCog) -> None:
+        self.cog = cog
+        components = [
+            disnake.ui.TextInput(label="Промокод", custom_id="code", max_length=32, placeholder="SALE25"),
+            disnake.ui.TextInput(label="Новый процент бонуса", custom_id="percent", max_length=4, placeholder="25"),
+            disnake.ui.TextInput(label="Новый макс. пользователей", custom_id="max_uses", max_length=8, placeholder="100"),
+        ]
+        super().__init__(title="Изменить промокод", components=components)
+
+    async def callback(self, inter: disnake.ModalInteraction) -> None:
+        try:
+            if not self.cog.is_admin(inter.author.id):
+                raise ValueError("Нет доступа.")
+            code = inter.text_values["code"].strip()
+            percent = parse_int(inter.text_values["percent"], "Процент", 1)
+            max_uses = parse_int(inter.text_values["max_uses"], "Макс. пользователей", 1)
+            promo = await self.cog.store.update_promo_code(code, percent, max_uses)
+            await self.cog.store.log(inter.author.id, "promo_edit", f"code={promo.code} percent={promo.bonus_percent} max_uses={promo.max_uses}")
+            await self.cog.send_audit_log(
+                "Админ: промокоды",
+                inter.author,
+                "Промокод изменен",
+                [("Промокод", f"`{promo.code}`", True), ("Бонус", f"+{promo.bonus_percent}%", True), ("Лимит", f"{promo.used_count}/{promo.max_uses}", True)],
+                COLOR_WARNING,
+            )
+            await inter.response.send_message(
+                embed=field_embed(
+                    "Промокод изменен",
+                    promo_line(promo),
+                    [("Промокод", f"`{promo.code}`", True), ("Статус", "активен" if promo.is_active else "истек", True)],
+                    COLOR_SUCCESS,
+                    inter.author,
+                ),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
+
+
+class PromoCodeActionModal(disnake.ui.Modal):
+    def __init__(self, cog: ShopCog, action: str) -> None:
+        self.cog = cog
+        self.action = action
+        title = "Убрать промокод" if action == "disable" else "Удалить промокод"
+        components = [disnake.ui.TextInput(label="Промокод", custom_id="code", max_length=32, placeholder="SALE25")]
+        super().__init__(title=title, components=components)
+
+    async def callback(self, inter: disnake.ModalInteraction) -> None:
+        try:
+            if not self.cog.is_admin(inter.author.id):
+                raise ValueError("Нет доступа.")
+            code = inter.text_values["code"].strip()
+            if self.action == "disable":
+                promo = await self.cog.store.disable_promo_code(code)
+                action_title = "Промокод убран"
+                description = "Теперь при вводе этого промокода бот покажет: `Промокод истек.`"
+                log_action = "promo_disable"
+                audit_action = "Промокод отключен"
+            elif self.action == "delete":
+                promo = await self.cog.store.delete_promo_code(code)
+                action_title = "Промокод удален"
+                description = "Промокод удален из базы данных."
+                log_action = "promo_delete"
+                audit_action = "Промокод удален из базы данных"
+            else:
+                raise ValueError("Неизвестное действие промокода.")
+
+            await self.cog.store.log(inter.author.id, log_action, f"code={promo.code}")
+            await self.cog.send_audit_log(
+                "Админ: промокоды",
+                inter.author,
+                audit_action,
+                [("Промокод", f"`{promo.code}`", True), ("Бонус", f"+{promo.bonus_percent}%", True), ("Использовано", f"{promo.used_count}/{promo.max_uses}", True)],
+                COLOR_ERROR if self.action == "delete" else COLOR_WARNING,
+            )
+            await inter.response.send_message(
+                embed=field_embed(
+                    action_title,
+                    description,
+                    [("Промокод", f"`{promo.code}`", True), ("Действие", self.action, True)],
                     COLOR_SUCCESS,
                     inter.author,
                 ),

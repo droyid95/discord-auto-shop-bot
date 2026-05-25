@@ -715,14 +715,67 @@ class Store:
         await self.conn.commit()
         return PromoCode(normalized, bonus_percent, max_uses, 0, True, created_by, now)
 
-    async def get_active_promo_code(self, code: str, db: aiosqlite.Connection | None = None) -> PromoCode | None:
+    async def list_promo_codes(self) -> list[PromoCode]:
+        rows = await self.conn.execute_fetchall("SELECT * FROM promo_codes ORDER BY created_at DESC, code")
+        return [self._promo_from_row(row) for row in rows]
+
+    async def get_promo_code(self, code: str) -> PromoCode | None:
         normalized = self.normalize_promo_code(code)
         if not normalized:
             return None
-        row = await self.fetchone("SELECT * FROM promo_codes WHERE code = ?", (normalized,), db)
-        if row is None:
-            return None
-        promo = PromoCode(
+        row = await self.fetchone("SELECT * FROM promo_codes WHERE code = ?", (normalized,))
+        return self._promo_from_row(row) if row else None
+
+    async def update_promo_code(self, code: str, bonus_percent: int, max_uses: int) -> PromoCode:
+        normalized = self.normalize_promo_code(code)
+        if not normalized:
+            raise ValueError("Укажите имя промокода.")
+        if bonus_percent < 1 or bonus_percent > 1000:
+            raise ValueError("Процент промокода должен быть от 1 до 1000.")
+        if max_uses < 1:
+            raise ValueError("Максимум пользователей должен быть больше 0.")
+        promo = await self.get_promo_code(normalized)
+        if promo is None:
+            raise ValueError("Промокод не найден.")
+        is_active = int(promo.used_count < max_uses)
+        await self.conn.execute(
+            """
+            UPDATE promo_codes
+            SET bonus_percent = ?, max_uses = ?, is_active = ?
+            WHERE code = ?
+            """,
+            (bonus_percent, max_uses, is_active, normalized),
+        )
+        await self.conn.commit()
+        updated = await self.get_promo_code(normalized)
+        if updated is None:
+            raise ValueError("Промокод не найден.")
+        return updated
+
+    async def disable_promo_code(self, code: str) -> PromoCode:
+        normalized = self.normalize_promo_code(code)
+        promo = await self.get_promo_code(normalized)
+        if promo is None:
+            raise ValueError("Промокод не найден.")
+        await self.conn.execute("UPDATE promo_codes SET is_active = 0 WHERE code = ?", (normalized,))
+        await self.conn.commit()
+        updated = await self.get_promo_code(normalized)
+        if updated is None:
+            raise ValueError("Промокод не найден.")
+        return updated
+
+    async def delete_promo_code(self, code: str) -> PromoCode:
+        normalized = self.normalize_promo_code(code)
+        promo = await self.get_promo_code(normalized)
+        if promo is None:
+            raise ValueError("Промокод не найден.")
+        async with self.transaction() as db:
+            await db.execute("DELETE FROM promo_uses WHERE code = ?", (normalized,))
+            await db.execute("DELETE FROM promo_codes WHERE code = ?", (normalized,))
+        return promo
+
+    def _promo_from_row(self, row: aiosqlite.Row) -> PromoCode:
+        return PromoCode(
             code=str(row["code"]),
             bonus_percent=int(row["bonus_percent"]),
             max_uses=int(row["max_uses"]),
@@ -731,6 +784,15 @@ class Store:
             created_by=int(row["created_by"]),
             created_at=int(row["created_at"]),
         )
+
+    async def get_active_promo_code(self, code: str, db: aiosqlite.Connection | None = None) -> PromoCode | None:
+        normalized = self.normalize_promo_code(code)
+        if not normalized:
+            return None
+        row = await self.fetchone("SELECT * FROM promo_codes WHERE code = ?", (normalized,), db)
+        if row is None:
+            return None
+        promo = self._promo_from_row(row)
         if not promo.is_active or promo.used_count >= promo.max_uses:
             if promo.is_active:
                 await (db or self.conn).execute("UPDATE promo_codes SET is_active = 0 WHERE code = ?", (promo.code,))
@@ -783,7 +845,7 @@ class Store:
                     raise ValueError("Вы уже использовали этот промокод.")
                 promo = await self.get_active_promo_code(normalized_promo, db)
                 if promo is None:
-                    raise ValueError("Промокод больше неактивен.")
+                    raise ValueError("Промокод истек.")
                 credited_amount = amount + (amount * promo.bonus_percent // 100)
 
             cursor = await db.execute(
