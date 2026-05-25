@@ -342,6 +342,7 @@ class ShopCog(commands.Cog):
         contexts=disnake.InteractionContextTypes.all(),
     )
     async def start(self, inter: disnake.ApplicationCommandInteraction) -> None:
+        await inter.response.defer(ephemeral=True)
         await self.store.ensure_user(inter.author.id, str(inter.author))
         is_admin = self.is_admin(inter.author.id)
         is_seller = await self.store.is_seller(inter.author.id)
@@ -350,10 +351,9 @@ class ShopCog(commands.Cog):
             description = "Вы администратор. Вам доступны админ-меню и магазин."
         elif is_seller:
             description = "Вы продавец. Вам доступны магазин и меню продавца."
-        await inter.response.send_message(
+        await inter.edit_original_response(
             embed=set_thumb(panel_embed("AutoShop", description), inter.author),
             view=StartMenuView(self, is_admin=is_admin, is_seller=is_seller),
-            ephemeral=True,
         )
 
     @commands.Cog.listener()
