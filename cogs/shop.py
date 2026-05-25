@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+import asyncio
 import random
 import time
 
@@ -273,14 +274,20 @@ class ShopCog(commands.Cog):
         provider: str = "yoomoney",
         promo_code: str | None = None,
     ) -> None:
+        async def reply(embed: disnake.Embed, view: disnake.ui.View | None = None) -> None:
+            if inter.response.is_done():
+                await inter.edit_original_response(embed=embed, view=view)
+            else:
+                await inter.response.send_message(embed=embed, view=view, ephemeral=True)
+
         promo_code = (promo_code or "").strip()
         print_payment_log(f"Deposit requested: user={inter.author.id} amount={amount} provider={provider} promo={promo_code or '-'}")
         if self.config.test_mode:
             invoice = await self.store.create_provider_invoice(inter.author.id, str(inter.author), amount, "test", promo_code or None)
             paid_invoice, credited = await self.store.mark_invoice_paid_by_id(invoice.id, "test_mode")
             print_payment_log(f"Test deposit handled: invoice={paid_invoice.id} credited={credited} user={paid_invoice.user_id}")
-            await inter.response.send_message(
-                embed=field_embed(
+            await reply(
+                field_embed(
                     "Баланс пополнен",
                     "Тестовый режим: счет автоматически зачислен.",
                     [
@@ -290,36 +297,40 @@ class ShopCog(commands.Cog):
                     ],
                     COLOR_SUCCESS,
                     inter.author,
-                ),
-                ephemeral=True,
+                )
             )
             return
         if provider == "yoomoney" and not self.config.yoomoney_enabled:
-            await inter.response.send_message(embed=error_embed("Пополнение YooMoney сейчас отключено."), ephemeral=True)
+            await reply(error_embed("Пополнение YooMoney сейчас отключено."))
             return
         if provider == "cryptopay" and not self.config.cryptopay_enabled:
-            await inter.response.send_message(embed=error_embed("Пополнение CryptoPay сейчас отключено."), ephemeral=True)
+            await reply(error_embed("Пополнение CryptoPay сейчас отключено."))
             return
         if amount < self.config.yoomoney_min_deposit or amount > self.config.yoomoney_max_deposit:
-            await inter.response.send_message(
-                embed=error_embed(
+            await reply(
+                error_embed(
                     f"Сумма должна быть от {money(self.config.yoomoney_min_deposit)} до {money(self.config.yoomoney_max_deposit)}."
                 ),
-                ephemeral=True,
             )
             return
 
         invoice = await self.store.create_provider_invoice(inter.author.id, str(inter.author), amount, provider, promo_code or None)
-        if provider == "cryptopay":
-            crypto_id, url, _ = await create_crypto_invoice(self.config, invoice)
-            await self.store.set_payment_invoice_operation(invoice.id, str(crypto_id), f"crypto_invoice={crypto_id}")
-            print_payment_log(f"CryptoPay operation attached: invoice={invoice.id} crypto_invoice={crypto_id}")
-            view = CryptoPaymentLinkView(url)
-            title = "Пополнение CryptoPay"
-        else:
-            url = create_quickpay_url(self.config, invoice)
-            view = PaymentLinkView(url)
-            title = "Пополнение YooMoney"
+        try:
+            if provider == "cryptopay":
+                crypto_id, url, _ = await create_crypto_invoice(self.config, invoice)
+                await self.store.set_payment_invoice_operation(invoice.id, str(crypto_id), f"crypto_invoice={crypto_id}")
+                print_payment_log(f"CryptoPay operation attached: invoice={invoice.id} crypto_invoice={crypto_id}")
+                view = CryptoPaymentLinkView(url)
+                title = "Пополнение CryptoPay"
+            else:
+                url = await asyncio.to_thread(create_quickpay_url, self.config, invoice)
+                view = PaymentLinkView(url)
+                title = "Пополнение YooMoney"
+        except Exception as exc:
+            await self.store.mark_payment_invoice_refused(invoice.label, f"{provider}_create_failed_{invoice.id}")
+            await self.store.log(inter.author.id, f"{provider}_invoice_create_failed", f"invoice={invoice.id} error={str(exc)[:500]}")
+            print_payment_log(f"{provider} invoice create failed: invoice={invoice.id} error={exc}")
+            raise ValueError(f"Не удалось создать ссылку оплаты {provider}. Попробуйте позже или выберите другой способ оплаты.") from exc
         fields = [
             ("К оплате", money(invoice.base_amount), True),
             ("Зачисление", money(invoice.amount), True),
@@ -329,8 +340,8 @@ class ShopCog(commands.Cog):
         if invoice.promo_code:
             fields.append(("Промокод", f"`{invoice.promo_code}` +{invoice.promo_bonus_percent}%", True))
         await self.store.log(inter.author.id, f"{provider}_invoice_create", f"invoice={invoice.id} base_amount={invoice.base_amount} amount={invoice.amount} promo={invoice.promo_code or '-'}")
-        await inter.response.send_message(
-            embed=field_embed(
+        await reply(
+            field_embed(
                 title,
                 "Перейдите по ссылке и оплатите счет. Баланс начислится автоматически после проверки платежа.",
                 fields,
@@ -338,7 +349,6 @@ class ShopCog(commands.Cog):
                 inter.author,
             ),
             view=view,
-            ephemeral=True,
         )
 
     @commands.slash_command(
@@ -715,6 +725,7 @@ class DepositModal(disnake.ui.Modal):
         super().__init__(title=f"Пополнить {provider_title}", components=components)
 
     async def callback(self, inter: disnake.ModalInteraction) -> None:
+        await inter.response.defer(ephemeral=True)
         try:
             if self.provider == "yoomoney" and not self.cog.config.yoomoney_enabled:
                 raise ValueError("Пополнение YooMoney сейчас отключено.")
@@ -724,7 +735,7 @@ class DepositModal(disnake.ui.Modal):
             promo_code = inter.text_values.get("promo_code", "").strip()
             await self.cog.create_deposit_panel(inter, amount, self.provider, promo_code)
         except Exception as exc:
-            await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
+            await inter.edit_original_response(embed=error_embed(str(exc)), view=None)
 
 
 class CabinetView(disnake.ui.View):
