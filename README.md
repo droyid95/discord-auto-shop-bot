@@ -96,6 +96,8 @@ yoomoney_receiver = "4100..."
 
 Токен получается через сайи YooMoney. В redirect URL можно указать `https://discord.com`.
 
+Pending-счета на пополнение автоматически истекают через `payment_invoice_ttl_seconds`, по умолчанию 10 минут. В сообщении со ссылкой оплаты есть кнопка отмены с двумя подтверждениями и предупреждением: если пользователь уже отправил деньги, отмена счета в боте не возвращает платеж автоматически, нужно связаться с администрацией и приложить чек/операцию.
+
 ### CryptoPay
 
 Для CryptoPay включите:
@@ -232,6 +234,7 @@ Discord-вложения по-прежнему поддерживаются бе
 - `color_payment_rgb = [26, 188, 156]`
 - `footer_text`
 - `upload_wait_timeout_seconds`
+- `payment_invoice_ttl_seconds`
 - `select_page_size`
 - `text_page_size`
 

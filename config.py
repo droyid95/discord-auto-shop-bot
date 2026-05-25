@@ -53,6 +53,7 @@ class BotConfig:
     color_payment: int
     footer_text: str
     upload_wait_timeout_seconds: int
+    payment_invoice_ttl_seconds: int
     select_page_size: int
     text_page_size: int
 
@@ -117,6 +118,10 @@ def load_config(path: str = "config.toml") -> BotConfig:
     if upload_wait_timeout_seconds < 1:
         raise ValueError("upload_wait_timeout_seconds должен быть больше 0.")
 
+    payment_invoice_ttl_seconds = int(raw.get("payment_invoice_ttl_seconds", 10 * 60))
+    if payment_invoice_ttl_seconds < 1:
+        raise ValueError("payment_invoice_ttl_seconds должен быть больше 0.")
+
     select_page_size = int(raw.get("select_page_size", 25))
     if select_page_size < 1 or select_page_size > 25:
         raise ValueError("select_page_size должен быть от 1 до 25.")
@@ -172,6 +177,7 @@ def load_config(path: str = "config.toml") -> BotConfig:
         color_payment=rgb_to_int(raw.get("color_payment_rgb", [26, 188, 156]), "color_payment_rgb"),
         footer_text=str(raw.get("footer_text", "AutoShop")),
         upload_wait_timeout_seconds=upload_wait_timeout_seconds,
+        payment_invoice_ttl_seconds=payment_invoice_ttl_seconds,
         select_page_size=select_page_size,
         text_page_size=text_page_size,
     )

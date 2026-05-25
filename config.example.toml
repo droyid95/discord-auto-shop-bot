@@ -33,6 +33,7 @@ footer_text = "AutoShop"
 
 # UX limits and timeouts.
 upload_wait_timeout_seconds = 600
+payment_invoice_ttl_seconds = 600
 select_page_size = 25
 text_page_size = 15
 

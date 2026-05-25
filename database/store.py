@@ -924,6 +924,31 @@ class Store:
         )
         await self.conn.commit()
 
+    async def cancel_payment_invoice(self, invoice_id: int, user_id: int) -> PaymentInvoice:
+        async with self.transaction() as db:
+            row = await self.fetchone(
+                "SELECT * FROM payment_invoices WHERE id = ? AND user_id = ?",
+                (invoice_id, user_id),
+                db,
+            )
+            if row is None:
+                raise ValueError("Счет не найден.")
+            invoice = self._payment_invoice_from_row(row)
+            if invoice.status != "pending":
+                raise ValueError("Этот счет уже нельзя отменить.")
+            await db.execute(
+                """
+                UPDATE payment_invoices
+                SET status = 'cancelled', paid_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (int(time.time()), invoice.id),
+            )
+        row = await self.fetchone("SELECT * FROM payment_invoices WHERE id = ?", (invoice_id,))
+        if row is None:
+            raise ValueError("Счет не найден.")
+        return self._payment_invoice_from_row(row)
+
     async def mark_yoomoney_invoice_paid(
         self,
         label: str,

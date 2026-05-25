@@ -85,7 +85,7 @@ async def yoomoney_payment_watcher(
     print_payment_log("YooMoney watcher started")
     while not bot.is_closed():
         try:
-            expired = await store.expire_pending_payment_invoices(24 * 60 * 60)
+            expired = await store.expire_pending_payment_invoices(config.payment_invoice_ttl_seconds)
             if expired:
                 print_payment_log(f"Expired pending payment invoices: {expired}")
             invoices = await store.list_pending_payment_invoices()

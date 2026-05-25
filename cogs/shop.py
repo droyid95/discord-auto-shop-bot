@@ -14,7 +14,7 @@ from disnake.ext import commands
 from config import BotConfig
 from database.store import Product, PromoCode, PurchaseRecord, Store, WithdrawalRequest
 from services.files import download_url_payload, save_attachment_payload, save_message_payload
-from services.cryptopay import CryptoPaymentLinkView, create_crypto_invoice
+from services.cryptopay import create_crypto_invoice
 from services.yoomoney import create_quickpay_url, print_payment_log
 from utils import money, parse_bool, parse_int
 
@@ -320,11 +320,11 @@ class ShopCog(commands.Cog):
                 crypto_id, url, _ = await create_crypto_invoice(self.config, invoice)
                 await self.store.set_payment_invoice_operation(invoice.id, str(crypto_id), f"crypto_invoice={crypto_id}")
                 print_payment_log(f"CryptoPay operation attached: invoice={invoice.id} crypto_invoice={crypto_id}")
-                view = CryptoPaymentLinkView(url)
+                view = PaymentLinkView(self, invoice.id, inter.author.id, url, "Оплатить CryptoPay")
                 title = "Пополнение CryptoPay"
             else:
                 url = await asyncio.to_thread(create_quickpay_url, self.config, invoice)
-                view = PaymentLinkView(url)
+                view = PaymentLinkView(self, invoice.id, inter.author.id, url, "Оплатить YooMoney")
                 title = "Пополнение YooMoney"
         except Exception as exc:
             await self.store.mark_payment_invoice_refused(invoice.label, f"{provider}_create_failed_{invoice.id}")
@@ -916,9 +916,105 @@ class WithdrawModal(disnake.ui.Modal):
 
 
 class PaymentLinkView(disnake.ui.View):
-    def __init__(self, url: str) -> None:
+    def __init__(self, cog: ShopCog, invoice_id: int, user_id: int, url: str, label: str) -> None:
         super().__init__(timeout=300)
-        self.add_item(disnake.ui.Button(label="Оплатить YooMoney", style=disnake.ButtonStyle.link, url=url))
+        self.cog = cog
+        self.invoice_id = invoice_id
+        self.user_id = user_id
+        self.add_item(disnake.ui.Button(label=label, style=disnake.ButtonStyle.link, url=url))
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.user_id:
+            await inter.response.send_message(embed=error_embed("Этот счет принадлежит другому пользователю."), ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Отменить пополнение", style=disnake.ButtonStyle.danger)
+    async def cancel_payment(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(
+            embed=field_embed(
+                "Отмена пополнения",
+                "Если вы уже отправили деньги по ссылке, отмена счета в боте не возвращает платеж автоматически. В таком случае свяжитесь с администрацией и приложите чек/операцию оплаты.",
+                [("Счет", f"#{self.invoice_id}", True), ("Подтверждение", "1 из 2", True)],
+                COLOR_WARNING,
+                inter.author,
+            ),
+            view=PaymentCancelFirstConfirmView(self.cog, self.invoice_id, self.user_id),
+        )
+
+
+class PaymentCancelFirstConfirmView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, invoice_id: int, user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.invoice_id = invoice_id
+        self.user_id = user_id
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.user_id:
+            await inter.response.send_message(embed=error_embed("Этот счет принадлежит другому пользователю."), ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Я понимаю", style=disnake.ButtonStyle.danger)
+    async def next_confirm(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(
+            embed=field_embed(
+                "Последнее подтверждение",
+                "После отмены бот перестанет автоматически отслеживать этот счет. Если платеж уже был отправлен, автоматическое зачисление может не пройти, и вопрос нужно будет решать через администрацию.",
+                [("Счет", f"#{self.invoice_id}", True), ("Подтверждение", "2 из 2", True)],
+                COLOR_ERROR,
+                inter.author,
+            ),
+            view=PaymentCancelFinalConfirmView(self.cog, self.invoice_id, self.user_id),
+        )
+
+    @disnake.ui.button(label="Не отменять", style=disnake.ButtonStyle.secondary)
+    async def keep_invoice(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(
+            embed=ok_embed("Отмена остановлена", "Счет остался активным. Вернитесь к ссылке оплаты из предыдущего сообщения, если хотите продолжить."),
+            view=None,
+        )
+
+
+class PaymentCancelFinalConfirmView(disnake.ui.View):
+    def __init__(self, cog: ShopCog, invoice_id: int, user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.invoice_id = invoice_id
+        self.user_id = user_id
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.author.id != self.user_id:
+            await inter.response.send_message(embed=error_embed("Этот счет принадлежит другому пользователю."), ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Отменить счет", style=disnake.ButtonStyle.danger)
+    async def confirm_cancel(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        try:
+            invoice = await self.cog.store.cancel_payment_invoice(self.invoice_id, inter.author.id)
+            await self.cog.store.log(inter.author.id, "payment_invoice_cancel", f"invoice={invoice.id} label={invoice.label}")
+            print_payment_log(f"Payment invoice cancelled: invoice={invoice.id} user={inter.author.id} label={invoice.label}")
+            await inter.response.edit_message(
+                embed=field_embed(
+                    "Пополнение отменено",
+                    "Счет отменен. Если вы уже оплатили его, напишите администрации и приложите чек/операцию оплаты.",
+                    [("Счет", f"`{invoice.label}`", True), ("Статус", invoice.status, True)],
+                    COLOR_SUCCESS,
+                    inter.author,
+                ),
+                view=None,
+            )
+        except Exception as exc:
+            await inter.response.send_message(embed=error_embed(str(exc)), ephemeral=True)
+
+    @disnake.ui.button(label="Не отменять", style=disnake.ButtonStyle.secondary)
+    async def keep_invoice(self, _: disnake.ui.Button, inter: disnake.MessageInteraction) -> None:
+        await inter.response.edit_message(
+            embed=ok_embed("Отмена остановлена", "Счет остался активным."),
+            view=None,
+        )
 
 
 class WithdrawalReviewView(disnake.ui.View):
