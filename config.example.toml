@@ -1,0 +1,114 @@
+# Discord bot token from https://discord.com/developers/applications
+bot_token = "PASTE_DISCORD_BOT_TOKEN_HERE"
+
+# Discord user IDs with full admin access to /admin.
+admin_ids = [123456789012345678]
+
+# Test guild ID for fast slash-command sync. Use 0 for global commands.
+guild_id = 0
+
+# Channel ID where purchase and error logs will be sent. Use 0 to disable.
+log_channel_id = 0
+
+# Currency label used in bot messages.
+currency_name = "Рубль"
+
+# SQLite database path.
+database_path = "data/shop.sqlite3"
+
+# Folder where product messages and files are stored.
+products_path = "products"
+
+# Max product file size for Discord attachments and HTTPS downloads.
+max_product_file_mb = 350
+
+# Embed colors in RGB format.
+color_primary_rgb = [88, 101, 242]
+color_neutral_rgb = [43, 45, 49]
+color_success_rgb = [46, 204, 113]
+color_warning_rgb = [241, 196, 15]
+color_error_rgb = [231, 76, 60]
+color_payment_rgb = [26, 188, 156]
+footer_text = "AutoShop"
+
+# UX limits and timeouts.
+upload_wait_timeout_seconds = 600
+payment_invoice_ttl_seconds = 600
+select_page_size = 25
+text_page_size = 15
+
+# Bot status:
+# 1 - Активен
+# 2 - Не беспокоить
+# 3 - Неактивен
+# 4 - Невидимка
+bot_status = 1
+
+# Bot activity type:
+# 1 - Играет
+# 2 - Слушает
+# 3 - Стримит
+activity_type = 1
+
+# Text shown after the selected activity.
+# Example: "ваши покупки" -> "Играет в ваши покупки"
+activity_text = "магазин"
+
+# Discord requires a stream URL for activity_type = 3.
+activity_stream_url = "https://www.twitch.tv/discord"
+
+# Seller action moderation.
+# false - seller changes are applied immediately.
+# true - seller product/category/payload edits require admin approval in log_channel_id.
+accept_admin = false
+
+# YooMoney wallet payment integration.
+# false - disabled, true - enables /deposit and background operation-history checks.
+yoomoney_enabled = false
+
+# OAuth token from YooMoney application authorization.
+# Create an app at https://yoomoney.ru/myservices/new and use scripts/give_token_yoomoney.py.
+yoomoney_token = "CHANGE_ME"
+
+# YooMoney wallet number that receives payments.
+yoomoney_receiver = "410011234567890"
+
+# Redirect URL used in YooMoney application registration. It can be a Discord/server/support URL.
+yoomoney_redirect_url = "https://discord.com"
+
+# Payment method passed to YooMoney Quickpay. SB is the same default used by the reference AutoShop.
+yoomoney_payment_type = "SB"
+
+# How often the bot checks operation-history for pending invoices.
+yoomoney_poll_interval_seconds = 10
+
+# Allowed deposit limits.
+yoomoney_min_deposit = 5
+yoomoney_max_deposit = 15000
+
+# Global test mode: embeds show a test-mode field; deposits are credited instantly.
+test_mode = false
+
+# CryptoPay integration without webhooks. Create token in @CryptoBot / @CryptoTestnetBot.
+cryptopay_enabled = false
+cryptopay_token = "CHANGE_ME"
+cryptopay_testnet = false
+cryptopay_poll_interval_seconds = 10
+
+# Seller payouts from sales. If disabled, sellers do not receive sale balance and cannot request withdrawals.
+seller_payout_enabled = false
+seller_payout_percent = 65
+seller_withdraw_delay_hours = 6
+
+# Text commands handled through on_message.
+message_command_prefix = "!"
+seed_ping_command = "pingseed"
+seed_products_command = "qwertasd122"
+clear_products_command = "clearproducts"
+
+# Test product seeding command settings.
+seed_seller_id = 631881341411131402
+seed_seller_name = "droyidept"
+seed_category_id = 2
+seed_subcategory_id = 2
+seed_product_count = 20
