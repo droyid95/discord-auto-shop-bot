@@ -4,6 +4,8 @@ Auto-shop - Это моя первая работа выложенная на п
 
 Связь / Сотрудничество: [Discord](https://discord.gg/CnkpdeyVAk) / [Telegram](https://t.me/qwertymoment)
 
+Telegram-версия проекта: [telegram-auto-shop-bot](https://github.com/droyid95/telegram-auto-shop-bot)
+
 # 🛒 Discord Auto Shop Bot
 
 Discord-бот магазина на Python + `disnake` с авто-выдачей товаров, балансом, категориями, продавцами, личным кабинетом и оплатой через YooMoney/CryptoPay.
